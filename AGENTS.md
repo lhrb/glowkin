@@ -1,15 +1,13 @@
 # Project instructions
 
-- Read `architecture.md` before designing or changing code. Omit unnecessary scaffolding; add structure only where needed.
-- Prefer the smallest working change. Preserve valid guarantees and keep unrelated work out of scope.
-- Choose sensible internal design and routine UX defaults. Escalate consequential product, security, privacy, data-lifecycle, or compatibility decisions.
-- Verify relevant behavior and report remaining gaps. Stop after the assigned work.
-- Be concise. 
-- Shorten as much as possible without any losing information, context or meaning. 
-- Answer, then reason, then next step. 
-- One idea per sentence
-- Use active voice
+- Read [architecture.md](architecture.md) before designing or changing code.
+- Make the smallest working change. Preserve guarantees; avoid scaffolding and unrelated changes.
+- Choose routine design and UX defaults. Escalate consequential product, security, privacy, data-lifecycle, or compatibility decisions.
+- Verify relevant behavior, report gaps, and stop at scope.
+- Be concise and use active voice. Give the answer, reason, then next step. Keep one idea per sentence.
 
+## Languages
 
-android/ contains android client
-server/ contains server code
+- `android/`: Kotlin. Pi extensions: JS/TS.
+- New Linux code: Rust, including the standalone Pi signal receiver. Use GPUI for desktop UI only. For Rust work, read [rust-conventions.md](rust-conventions.md).
+- `server/`: Standalone Rust bridge. Preserve the Android-facing contract.

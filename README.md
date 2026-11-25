@@ -5,4 +5,4 @@ Glowkin is a collection of tools and extensions for working with Pi in tmux. The
 ## Repository layout
 
 - [`android/`](android/) — Android app for mobile input and session control.
-- [`server/`](server/) — Bridge that connects the app to tmux.
+- [`server/`](server/) — Standalone Rust bridge for Android. See [deployment](docs/features/android-agent-control/connection-deployment.md).
