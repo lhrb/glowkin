@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 mod features {
     pub mod connection;
+    pub mod workspace;
 }
 
 #[derive(Parser)]

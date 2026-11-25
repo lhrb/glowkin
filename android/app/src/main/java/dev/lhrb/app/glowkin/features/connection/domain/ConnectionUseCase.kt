@@ -3,11 +3,21 @@ package dev.lhrb.app.glowkin.features.connection.domain
 import dev.lhrb.app.glowkin.features.connection.domain.ports.EndpointStorePort
 import dev.lhrb.app.glowkin.features.connection.domain.ports.SnapshotTransportPort
 
-data class Snapshot(val revision: String)
+data class Snapshot(val revision: String, val workspace: Workspace? = null)
+
+sealed interface Workspace {
+    data class Ready(val target: SessionTarget, val name: String, val windows: List<WorkspaceWindow>) : Workspace
+    data object NoSession : Workspace
+    data object MultipleSessions : Workspace
+    data object Unavailable : Workspace
+}
+
+data class SessionTarget(val id: String, val generation: String)
+data class WorkspaceWindow(val id: String, val name: String)
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED }
 enum class ConnectionError { UNREACHABLE, PROTOCOL }
 class ConnectionFailure(val error: ConnectionError) : Exception(error.name)
-enum class ChangeOutcome { APPLIED, UNCERTAIN, RECONCILIATION_REQUIRED, NOT_CONNECTED }
+enum class ChangeOutcome { APPLIED, TARGET_UNAVAILABLE, REJECTED, UNCERTAIN, RECONCILIATION_REQUIRED, NOT_CONNECTED }
 
 data class ConnectionState(
     val endpoint: Endpoint? = null,
@@ -16,7 +26,12 @@ data class ConnectionState(
     val stale: Boolean = false,
     val error: ConnectionError? = null,
     val needsReconciliation: Boolean = false,
-)
+    val changeOutcome: ChangeOutcome? = null,
+) {
+    val shellTarget: SessionTarget?
+        get() = (snapshot?.workspace as? Workspace.Ready)?.target
+            ?.takeIf { status == ConnectionStatus.CONNECTED && !stale && !needsReconciliation }
+}
 
 /** Blocking ports belong on a worker. Invalidation never waits for an in-flight read. */
 class ConnectionUseCase(private val store: EndpointStorePort, private val transport: SnapshotTransportPort) {
@@ -85,10 +100,16 @@ class ConnectionUseCase(private val store: EndpointStorePort, private val transp
         synchronized(lock) {
             if (endpointGeneration == token) {
                 changeInFlight = false
-                if (outcome == ChangeOutcome.UNCERTAIN) {
-                    // Reads begun before delivery became uncertain cannot reconcile it.
-                    generation++
-                    state = state.copy(needsReconciliation = true, stale = state.snapshot != null)
+                when (outcome) {
+                    ChangeOutcome.UNCERTAIN -> {
+                        // Reads begun before delivery became uncertain cannot reconcile it.
+                        generation++
+                        state = state.copy(needsReconciliation = true, stale = state.snapshot != null, changeOutcome = outcome)
+                    }
+                    ChangeOutcome.APPLIED, ChangeOutcome.TARGET_UNAVAILABLE, ChangeOutcome.REJECTED -> {
+                        state = state.copy(changeOutcome = outcome)
+                    }
+                    ChangeOutcome.RECONCILIATION_REQUIRED, ChangeOutcome.NOT_CONNECTED -> Unit
                 }
             }
         }

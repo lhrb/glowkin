@@ -4,6 +4,7 @@ import android.util.JsonReader
 import android.util.JsonToken
 import dev.lhrb.app.glowkin.features.connection.domain.*
 import dev.lhrb.app.glowkin.features.connection.domain.ports.SnapshotTransportPort
+import org.json.JSONObject
 import java.io.IOException
 import java.io.StringReader
 import java.net.HttpURLConnection
@@ -14,14 +15,9 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
     init { require(timeoutMillis > 0) }
 
     override fun fetch(endpoint: Endpoint): Snapshot {
-        val url = URI("http", null, endpoint.host, endpoint.port, "/v1/connection/snapshot", null, null).toURL()
-        val connection = url.openConnection(Proxy.NO_PROXY) as HttpURLConnection
+        val connection = connection(endpoint, "/v1/connection/snapshot")
         try {
             connection.requestMethod = "GET"
-            connection.instanceFollowRedirects = false
-            connection.useCaches = false
-            connection.connectTimeout = timeoutMillis
-            connection.readTimeout = timeoutMillis
             connection.setRequestProperty("Accept", "application/json")
             connection.setRequestProperty("Cache-Control", "no-cache, no-store")
             if (connection.responseCode != 200) throw ConnectionFailure(ConnectionError.PROTOCOL)
@@ -36,6 +32,40 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
             throw ConnectionFailure(ConnectionError.UNREACHABLE)
         } finally {
             connection.disconnect()
+        }
+    }
+
+    fun openShell(endpoint: Endpoint, target: SessionTarget): ChangeOutcome {
+        val body = JSONObject().put("sessionId", target.id).put("generation", target.generation)
+            .toString().toByteArray(Charsets.UTF_8)
+        val connection = connection(endpoint, "/v1/workspace/open-shell")
+        try {
+            connection.requestMethod = "POST"
+            connection.doOutput = true
+            connection.setRequestProperty("Content-Type", "application/json")
+            // Streaming disables HttpURLConnection's transparent replay of a buffered POST.
+            connection.setFixedLengthStreamingMode(body.size)
+            connection.outputStream.use { it.write(body) }
+            return when (connection.responseCode) {
+                204 -> ChangeOutcome.APPLIED
+                409 -> ChangeOutcome.TARGET_UNAVAILABLE
+                in 400..499 -> ChangeOutcome.REJECTED
+                else -> ChangeOutcome.UNCERTAIN
+            }
+        } catch (_: IOException) {
+            return ChangeOutcome.UNCERTAIN
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun connection(endpoint: Endpoint, path: String): HttpURLConnection {
+        val url = URI("http", null, endpoint.host, endpoint.port, path, null, null).toURL()
+        return (url.openConnection(Proxy.NO_PROXY) as HttpURLConnection).apply {
+            instanceFollowRedirects = false
+            useCaches = false
+            connectTimeout = timeoutMillis
+            readTimeout = timeoutMillis
         }
     }
 
@@ -56,6 +86,7 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                 reader.isLenient = false
                 var versionSeen = false
                 var revision: String? = null
+                var workspace: Workspace? = null
                 reader.beginObject()
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
@@ -69,6 +100,10 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                             if (revision != null || reader.peek() != JsonToken.STRING) throw ConnectionFailure(ConnectionError.PROTOCOL)
                             revision = reader.nextString()
                         }
+                        "workspace" -> {
+                            if (workspace != null) throw ConnectionFailure(ConnectionError.PROTOCOL)
+                            workspace = reader.readWorkspace()
+                        }
                         else -> reader.skipValue()
                     }
                 }
@@ -76,7 +111,7 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                 if (!versionSeen || revision.isNullOrEmpty() || reader.peek() != JsonToken.END_DOCUMENT) {
                     throw ConnectionFailure(ConnectionError.PROTOCOL)
                 }
-                return Snapshot(revision)
+                return Snapshot(revision, workspace)
             }
         } catch (failure: ConnectionFailure) {
             throw failure
@@ -86,4 +121,79 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
             throw ConnectionFailure(ConnectionError.PROTOCOL)
         }
     }
+
+    private fun JsonReader.readWorkspace(): Workspace {
+        var status: String? = null
+        var session: Workspace.Ready? = null
+        readFields { field ->
+            when (field) {
+                "status" -> status = readString()
+                "session" -> session = readSession()
+                else -> skipValue()
+            }
+        }
+        return when (status) {
+            "ready" -> session ?: throw ConnectionFailure(ConnectionError.PROTOCOL)
+            "no_session" -> Workspace.NoSession
+            "multiple_sessions" -> Workspace.MultipleSessions
+            "unavailable" -> Workspace.Unavailable
+            else -> throw ConnectionFailure(ConnectionError.PROTOCOL)
+        }
+    }
+
+    private fun JsonReader.readSession(): Workspace.Ready {
+        var id: String? = null
+        var generation: String? = null
+        var name: String? = null
+        var windows: List<WorkspaceWindow>? = null
+        readFields { field ->
+            when (field) {
+                "id" -> id = readString()
+                "generation" -> generation = readString()
+                "name" -> name = readString()
+                "windows" -> {
+                    beginArray()
+                    windows = buildList { while (hasNext()) add(readWindow()) }
+                    endArray()
+                }
+                else -> skipValue()
+            }
+        }
+        return Workspace.Ready(SessionTarget(requireId(id), requireId(generation)), requireString(name),
+            windows ?: throw ConnectionFailure(ConnectionError.PROTOCOL))
+    }
+
+    private fun JsonReader.readWindow(): WorkspaceWindow {
+        var id: String? = null
+        var name: String? = null
+        readFields { field ->
+            when (field) {
+                "id" -> id = readString()
+                "name" -> name = readString()
+                else -> skipValue()
+            }
+        }
+        return WorkspaceWindow(requireId(id), requireString(name))
+    }
+
+    private inline fun JsonReader.readFields(read: (String) -> Unit) {
+        val seen = mutableSetOf<String>()
+        beginObject()
+        while (hasNext()) {
+            val field = nextName()
+            if (!seen.add(field)) throw ConnectionFailure(ConnectionError.PROTOCOL)
+            read(field)
+        }
+        endObject()
+    }
+
+    private fun JsonReader.readString(): String {
+        if (peek() != JsonToken.STRING) throw ConnectionFailure(ConnectionError.PROTOCOL)
+        return nextString()
+    }
+
+    private fun requireString(value: String?): String = value ?: throw ConnectionFailure(ConnectionError.PROTOCOL)
+
+    private fun requireId(value: String?): String =
+        value?.takeIf { it.isNotEmpty() } ?: throw ConnectionFailure(ConnectionError.PROTOCOL)
 }

@@ -2,15 +2,16 @@
 
 ## Scope and security
 
-This slice exposes only bridge identity through a connection snapshot.
-It does not discover workspaces, attach to tmux/pi, or expose command routes.
+The bridge snapshot reports bridge identity and tmux workspace state.
+Android can list windows and open a shell in one existing tmux session on the configured server.
+It cannot create sessions, close windows, or attach to pi.
 A connected screen establishes bridge reachability, not agent availability.
-The opaque revision identifies this bridge process lifetime; it is not an ordered counter.
-Future inventory slices must extend the authoritative snapshot rather than infer agent state from connectivity.
+The opaque revision identifies the bridge process lifetime; it is not an ordered counter.
+Future inventory must extend the authoritative snapshot rather than infer agent state from connectivity.
 
 HTTP address-only access is **unauthenticated PC control for trusted networks only**.
 There is no login, pairing, token, TLS, or application-level authorization.
-Any reachable peer can read/control the PC as later capabilities become available.
+Any reachable peer can read the window list and request a new shell window when exactly one session is available.
 WLAN alone does not authorize peers.
 Do not forward this port publicly or deploy behind a public ingress.
 Restrict the listener and firewall to intended peers; restrict Tailscale access with tailnet policy.
@@ -18,10 +19,18 @@ Tailscale supplies its own encrypted network transport, not application authenti
 A shared or untrusted WLAN requires suitable network isolation or Tailscale instead.
 Do not change global firewall policy merely to make this example work.
 
-## Run the server
+## Try the single-session workflow
 
-Build with Rust and Cargo. Run the standalone binary without Python or Pi.
-From the repository root:
+1. On the PC, start `tmux` if needed and leave exactly one session running. Create a window with `Ctrl+b c`.
+2. From the repository root, run `./server/run-server.sh --bind <trusted PC IP>`, replacing the placeholder with the PC's trusted WLAN or Tailscale IP. The script builds and runs the release bridge with Cargo and forwards bridge flags. Omit `--bind` for loopback only.
+3. If needed, install the debug app on the connected Android device from the repository root: `cd android && ./gradlew :app:installDebug` (requires compile SDK 37).
+4. In Glowkin, enter the PC IP and port `8787`, then tap **Save and connect** or **Replace and connect**. Under **tmux workspace**, tap **Refresh** to check for PC-created windows. Tap **Open shell** and check on the PC that a new interactive shell opened at home in the same session.
+
+See [the plan](plan.md#see-and-open-windows-in-one-existing-session) for review and verification.
+
+## Run the standalone binary
+
+To build once and run the standalone binary without Cargo, Python, or Pi at runtime:
 
 ```sh
 cargo build --release --locked --manifest-path server/Cargo.toml
@@ -54,18 +63,12 @@ curl --fail http://127.0.0.1:8787/v1/connection/snapshot
 ```
 
 Use the chosen bind address instead of loopback when necessary.
-Expect HTTP 200, `application/json`, and `{"protocolVersion":1,"revision":"..."}`.
+Expect HTTP 200 and `application/json` with `protocolVersion: 1`, an opaque `revision`, and `workspace` state.
+`POST /v1/workspace/open-shell` is the only mutation route.
 Unknown routes return 404; mutations to the snapshot route return 405.
 There is no remote disconnect route.
 
 ## Android
-
-Build and install with an Android SDK supporting compile SDK 37:
-
-```sh
-cd android
-./gradlew :app:assembleDebug :app:installDebug
-```
 
 Target SDK remains 36; minimum SDK remains 28.
 Open Glowkin and enter a hostname or IP address and a separate port.
@@ -122,7 +125,7 @@ adb -s emulator-5554 reverse tcp:8787 tcp:8787
 adb -s emulator-5554 reverse --remove tcp:8787
 ```
 
-## Manual acceptance checklist — not yet established by automated tests
+## Original connection manual acceptance checklist
 
 1. On a physical Android device and PC on the intended trusted WLAN, bind the PC's WLAN address and permit only the intended peer through host controls.
 2. Enter that address/port in Android and verify connecting then connected, without login or pairing.

@@ -22,18 +22,20 @@ class MainActivity : ComponentActivity() {
     private lateinit var connection: ConnectionModule
     private var state by mutableStateOf(ConnectionState())
     private var storageError by mutableStateOf<String?>(null)
+    private var openingShell by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        connection = ConnectionModule(applicationContext) { current, error ->
+        connection = ConnectionModule(applicationContext) { current, error, opening ->
             state = current
             storageError = error
+            openingShell = opening
         }
         setContent {
             GlowkinTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    ConnectionScreen(state, storageError, connection, Modifier.padding(padding))
+                    ConnectionScreen(state, storageError, openingShell, connection, Modifier.padding(padding))
                 }
             }
         }
@@ -45,7 +47,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ConnectionScreen(state: ConnectionState, storageError: String?, connection: ConnectionModule, modifier: Modifier) {
+private fun ConnectionScreen(state: ConnectionState, storageError: String?, openingShell: Boolean, connection: ConnectionModule, modifier: Modifier) {
     var host by rememberSaveable { mutableStateOf("") }
     var port by rememberSaveable { mutableStateOf("8787") }
     var inputError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -69,7 +71,7 @@ private fun ConnectionScreen(state: ConnectionState, storageError: String?, conn
             } catch (failure: InvalidEndpoint) { inputError = failure.message }
         }) { Text(if (state.endpoint == null) "Save and connect" else "Replace and connect") }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = connection::retry, enabled = state.endpoint != null) { Text("Retry") }
+            OutlinedButton(onClick = connection::retry, enabled = state.endpoint != null && !openingShell) { Text("Retry") }
             OutlinedButton(onClick = connection::disconnect, enabled = state.endpoint != null) { Text("Disconnect") }
         }
         val error = inputError ?: storageError ?: when (state.error) {
@@ -82,7 +84,42 @@ private fun ConnectionScreen(state: ConnectionState, storageError: String?, conn
             Text(if (state.stale) "Stale snapshot — not current PC state" else "Current bridge snapshot")
             Text("Bridge revision: ${it.revision}")
         }
-        Text("Connection only: workspace and agent inventory is not available yet. Disconnection does not mean agents stopped or commands succeeded.")
+        if (state.snapshot != null) WorkspaceSection(state, openingShell, connection)
+        Text("Disconnection does not stop PC work or confirm whether a command succeeded.")
         Text("Unauthenticated HTTP PC control: use trusted networks only. WLAN alone does not authorize peers. Restrict access with firewall or Tailscale policy; never expose publicly.")
+    }
+}
+
+@Composable
+private fun WorkspaceSection(state: ConnectionState, openingShell: Boolean, connection: ConnectionModule) {
+    Text("tmux workspace", style = MaterialTheme.typography.titleLarge)
+    val workspace = state.snapshot?.workspace
+    if (workspace != null) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = connection::retry, enabled = !openingShell) { Text("Refresh") }
+            if (workspace is Workspace.Ready) {
+                Button(onClick = { connection.openShell(state) }, enabled = !openingShell && state.shellTarget != null) {
+                    Text("Open shell")
+                }
+            }
+        }
+    }
+    val feedback = when (state.changeOutcome) {
+        ChangeOutcome.APPLIED -> "Shell window opened."
+        ChangeOutcome.TARGET_UNAVAILABLE -> "Could not open a shell: the listed tmux session is no longer available."
+        ChangeOutcome.REJECTED -> "The bridge rejected Open shell. Check the bridge version and settings."
+        ChangeOutcome.UNCERTAIN -> "Open shell may have succeeded. Check the PC windows before trying again."
+        else -> null
+    }
+    feedback?.let { Text(it) }
+    when (workspace) {
+        is Workspace.Ready -> {
+            Text("Session: ${workspace.name}")
+            workspace.windows.forEach { Text(it.name) }
+        }
+        Workspace.NoSession -> Text("Start a tmux session on the PC to see its windows here.")
+        Workspace.MultipleSessions -> Text("Glowkin supports one tmux session at a time. Manage sessions on the PC.")
+        Workspace.Unavailable -> Text("Cannot read tmux. Check that tmux and a session are running on the PC.")
+        null -> Text("This bridge does not report tmux windows. Update the bridge to use workspace controls.")
     }
 }

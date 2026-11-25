@@ -1,6 +1,8 @@
 # Manage tmux windows and select project directories
 
-Depends on: connection.md
+Depends on: [connection.md](connection.md)
+
+This is the full workspace target, not the prototype acceptance checklist. Start with [one existing session](plan.md#see-and-open-windows-in-one-existing-session). Track the rest in [deferred.md](deferred.md).
 
 ## Outcome
 Browse existing tmux sessions and windows, create or close windows, and select a PC directory without typing shell commands.

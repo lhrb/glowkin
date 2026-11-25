@@ -11,7 +11,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /** One worker serializes persistence and HTTP. Epochs discard obsolete lifecycle/UI deliveries. */
-class ConnectionModule(context: Context, private val render: (ConnectionState, String?) -> Unit) {
+class ConnectionModule(context: Context, private val render: (ConnectionState, String?, Boolean) -> Unit) {
     private val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val worker = Executors.newSingleThreadScheduledExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -20,10 +20,12 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
     private var polling: ScheduledFuture<*>? = null
     private var foreground = false
     private var wanted = true
+    private var openingShell = false
+    private val transport = HttpSnapshotTransport()
 
     init {
         worker.execute {
-            useCase = ConnectionUseCase(SharedPreferencesEndpointStore(preferences), HttpSnapshotTransport())
+            useCase = ConnectionUseCase(SharedPreferencesEndpointStore(preferences), transport)
         }
     }
 
@@ -45,7 +47,6 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
     fun disconnect() {
         wanted = false
         invalidate()
-        useCase?.let { render(it.state, null) }
     }
 
     fun retry() {
@@ -71,11 +72,41 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         }
     }
 
+    fun openShell(shown: ConnectionState) {
+        val endpoint = shown.endpoint ?: return
+        val target = shown.shellTarget ?: return
+        if (!foreground || !wanted || openingShell) return
+        val token = epoch
+        openingShell = true
+        render(shown, null, true)
+        worker.execute {
+            if (token != epoch) return@execute
+            val connection = useCase!!
+            connection.attemptChange {
+                val current = connection.state
+                when {
+                    current.endpoint != endpoint || token != epoch -> ChangeOutcome.NOT_CONNECTED
+                    current.shellTarget != target -> ChangeOutcome.TARGET_UNAVAILABLE
+                    else -> transport.openShell(endpoint, target)
+                }
+            }
+            if (token != epoch) return@execute
+            publish(token)
+            connection.poll()
+            if (token != epoch) connection.disconnect()
+            publish(token, finishedOpening = true)
+        }
+    }
+
     private fun invalidate() {
         epoch++
+        openingShell = false
         polling?.cancel(false)
         polling = null
-        useCase?.disconnect() // No I/O; invalidates even a currently blocked HTTP response.
+        useCase?.let {
+            it.disconnect() // No I/O; invalidates even a currently blocked HTTP response.
+            if (foreground) render(it.state, null, false)
+        }
     }
 
     private fun schedule() {
@@ -101,10 +132,15 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         }, 0, 2, TimeUnit.SECONDS)
     }
 
-    private fun publish(token: Long, error: String? = null, connecting: Boolean = false) {
+    private fun publish(token: Long, error: String? = null, connecting: Boolean = false, finishedOpening: Boolean = false) {
         val state = useCase!!.state.let {
             if (connecting) it.copy(status = ConnectionStatus.CONNECTING) else it
         }
-        main.post { if (token == epoch && foreground) render(state, error) }
+        main.post {
+            if (token == epoch && foreground) {
+                if (finishedOpening) openingShell = false
+                render(state, error, openingShell)
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Share live pi conversations between Android and the PC
 
-Depends on: workspaces.md
+First follow-up: join one existing agent after the [single-session prototype](plan.md#see-and-open-windows-in-one-existing-session). That does not require remote close, recovery, or directory selection. This document describes the full chat target; project launch needs directory selection from [workspaces.md](workspaces.md).
 
 ## Outcome
 Start pi in a selected project or join an existing interactive pi agent, then chat and stop work from either device.
