@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-cd -- "$(dirname -- "$0")"
+CDPATH= cd -- "$(dirname -- "$0")"
 product=$(pwd -P)
 bin=$HOME/.local/bin
 share=$HOME/.local/share/glowkin-pi

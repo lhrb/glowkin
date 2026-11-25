@@ -8,7 +8,7 @@ On Linux with Cargo, tmux, and Pi, run `./pi-tmux-signals/install.sh` from the r
 
 The installer builds the release receiver, installs it to `~/.local/bin/pi-tmux-signals`, and creates the private `~/.local/state/glowkin-pi/work/` directory. It stages the configs and extensions in `~/.local/share/glowkin-pi/` and runs `pi install extension.ts` and `pi install permission-system.ts` there. It does not edit your tmux config.
 
-Add this line to the desired tmux server’s config (usually `~/.tmux.conf`):
+Add this line to `~/.tmux.conf` (or the config for the server you want). Replace any previous Pi signals startup block:
 
 ```tmux
 source-file ~/.local/share/glowkin-pi/startup.tmux
@@ -22,6 +22,6 @@ The permission adapter observes `@gotgenes/pi-permission-system` only if you alr
 
 ## Verify
 
-From the repository root, run the offline startup smoke test: `bash pi-tmux-signals/tests/verify-startup.sh`.
+From the repository root, run `bash pi-tmux-signals/tests/verify-startup.sh` (offline; requires Python 3).
 
-Optional: run `bash pi-tmux-signals/tests/verify-capture.sh` with Python 3 and the permission package installed. Set `PI_PERMISSION_PACKAGE` to the installed package directory if you use a custom location.
+To also test permission prompts, run `bash pi-tmux-signals/tests/verify-capture.sh` with the permission package installed. Set `PI_PERMISSION_PACKAGE` to the installed package directory if you use a custom location.

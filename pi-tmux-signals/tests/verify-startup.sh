@@ -43,7 +43,7 @@ wait_for() {
 marked() { grep -Fxq -- "$2" "$root/$1/trace" 2>/dev/null; }
 mark_wait() { wait_for marked "$1" "$2" || fail "$1 never reported '$2'."; }
 
-# One-time setup (the README commands, plus the isolated fixture settings).
+# Set up a private receiver and fixture, capturing receiver stderr for the collision check.
 cargo build --quiet --locked --release --manifest-path "$product/Cargo.toml" --target-dir "$root/target"
 install -d "$bin" "$share" "$home/.pi/agent/extensions"
 install -d -m 700 "${signal%/*}"
