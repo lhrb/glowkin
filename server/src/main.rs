@@ -23,6 +23,7 @@ async fn main() -> io::Result<()> {
     let args = Args::parse();
     eprintln!(
         "WARNING: unauthenticated HTTP PC control for trusted networks only. \
+        Any reachable peer can read eligible pane contents. \
         Never expose publicly; restrict peers with firewall/Tailscale policy."
     );
     let listener = TcpListener::bind((args.bind.as_str(), args.port.get())).await?;
