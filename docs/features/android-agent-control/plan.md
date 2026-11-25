@@ -3,17 +3,18 @@
 Goal: Use one Android overview to manage tmux windows, select projects, and chat with existing or newly started pi agents while retaining PC keyboard control.
 
 Decisions and assumptions: See [decisions.md](decisions.md); trusted-network address-only access, shared interactive pi sessions, directory selection only, and remote recovery when no tmux sessions remain.
-Open questions: None for the workspace slice. Verify selected-directory entry and shell fallback during implementation.
+Open questions: Can a server-side tmux command guard closure against stale targets? Verify selected-directory entry and shell fallback during implementation.
 
 | Order | Feature | Depends on | Status |
 |---|---|---|---|
 | 1 | [connection.md](connection.md) | — | Done |
 | 2 | [Probe tmux working-directory launch](#probe-tmux-working-directory-launch) | — | Done |
-| 3 | [workspaces.md](workspaces.md) | connection.md | Ready |
-| 4 | [shared-pi-chat.md](shared-pi-chat.md) | workspaces.md | Blocked |
-| 5 | [agent-overview.md](agent-overview.md) | shared-pi-chat.md | Blocked |
+| 3 | [Probe stale tmux window closure](#probe-stale-tmux-window-closure) | — | Ready |
+| 4 | [workspaces.md](workspaces.md) | connection.md, stale-window closure probe | Blocked on probe outcome |
+| 5 | [shared-pi-chat.md](shared-pi-chat.md) | workspaces.md | Blocked |
+| 6 | [agent-overview.md](agent-overview.md) | shared-pi-chat.md | Blocked |
 
-Next: [workspaces.md](workspaces.md)
+Next: [Probe stale tmux window closure](#probe-stale-tmux-window-closure)
 Review: Probe tmux working-directory launch: pending
 
 Connection verification: 3 server tests, 12 domain tests plus the existing JVM example, 6 emulator tests, debug build, and lint pass. The user confirmed manual acceptance and requested completion. IPv6 routing remains unverified. See [connection-deployment.md](connection-deployment.md).
@@ -53,3 +54,15 @@ Type: Experiment
 **Limitations:** This tests tmux 3.8 on this host with the specified path and a deterministic deletion between validation and launch. It does not establish the cause of the substitution, behavior on other versions, handling of unreadable directories, or behavior in other filesystem races.
 
 **Cleanup:** Issued `kill-server` only on the three probe sockets. Confirmed no probe server was reachable and all five probe pane PIDs were gone. Removed the temporary directory and verified it was absent. No bridge or Android code changed and no probe artifacts remain.
+
+## Probe stale tmux window closure
+
+Type: Experiment
+
+**Question:** Can a guarded tmux command reject a stale server lifetime or session/window pair at execution time, without a separate bridge-side check before `kill-window`?
+
+**Decision:** Use a native guarded close only if the server checks its lifetime and the window's membership in the requested session before killing that exact window, with no intervening yield. Otherwise keep workspaces blocked until a safe approach is established.
+
+**Required evidence:** Record the exact command and tmux version. Show that a current pair closes only its window. Show that the same request fails after the window moves to another session, and that an old request fails after restarting the server on the same socket with reused IDs. For both failures record the command status and inventory before and after to show the surviving targets were untouched. Explain from tmux command queue semantics why the guard and close do not yield between validation and mutation; a successful check in a separate tmux invocation is not sufficient.
+
+**Prerequisites and safeguards:** Use the installed tmux, a private temporary socket, an empty config, and no inherited `TMUX` or `TMUX_PANE`. Use only disposable shell or `/bin/sleep` panes. Never target the user's tmux server. Stop only the probe server and remove its temporary files. Do not change bridge or Android code.
