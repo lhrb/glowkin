@@ -98,7 +98,7 @@ fn anonymous_snapshot_is_stable_until_restart() {
 }
 
 #[test]
-fn rejects_unknown_routes_and_mutations() {
+fn rejects_unknown_routes_and_unsupported_methods() {
     let (_bridge, address) = start_bridge();
     for (method, path, expected) in [
         ("GET", "/", 404),
@@ -110,12 +110,20 @@ fn rejects_unknown_routes_and_mutations() {
         ("PUT", SNAPSHOT, 405),
         ("PATCH", SNAPSHOT, 405),
         ("DELETE", SNAPSHOT, 405),
+        ("OPTIONS", SNAPSHOT, 501),
+        ("OPTIONS", "/", 501),
     ] {
-        assert_eq!(
-            status(&request(address, method, path)),
-            expected,
-            "{method} {path}"
-        );
+        let response = request(address, method, path);
+        assert_eq!(status(&response), expected, "{method} {path}");
+        if expected == 405 {
+            let (headers, _) = response.split_once("\r\n\r\n").unwrap();
+            assert!(
+                headers
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("allow: GET")),
+                "{method} {path}: expected Allow: GET, got {headers:?}"
+            );
+        }
     }
 }
 

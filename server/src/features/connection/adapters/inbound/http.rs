@@ -41,35 +41,38 @@ fn snapshot_response(
     request: Request<hyper::body::Incoming>,
     body: &Bytes,
 ) -> Response<Full<Bytes>> {
-    let status = match *request.method() {
-        Method::GET | Method::POST | Method::PUT | Method::PATCH | Method::DELETE => {
-            if request.uri().path_and_query().map(|path| path.as_str()) != Some(SNAPSHOT_PATH) {
-                StatusCode::NOT_FOUND
-            } else if request.method() == Method::GET {
-                StatusCode::OK
-            } else {
-                StatusCode::METHOD_NOT_ALLOWED
-            }
-        }
-        _ => StatusCode::NOT_IMPLEMENTED,
-    };
-
     let mut response = Response::new(Full::default());
-    *response.status_mut() = status;
-    if status == StatusCode::OK {
-        *response.body_mut() = Full::new(body.clone());
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
-        );
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            header::HeaderValue::from_static("no-store"),
-        );
-    } else if status == StatusCode::METHOD_NOT_ALLOWED {
+    let method = request.method();
+    if !matches!(
+        *method,
+        Method::GET | Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+        return response;
+    }
+
+    // Match the path and query together so query strings are rejected too.
+    if request.uri().path_and_query().map(|target| target.as_str()) != Some(SNAPSHOT_PATH) {
+        *response.status_mut() = StatusCode::NOT_FOUND;
+        return response;
+    }
+
+    if method != Method::GET {
+        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
         response
             .headers_mut()
             .insert(header::ALLOW, header::HeaderValue::from_static("GET"));
+        return response;
     }
+
+    *response.body_mut() = Full::new(body.clone());
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
     response
 }
