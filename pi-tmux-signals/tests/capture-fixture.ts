@@ -54,9 +54,17 @@ export default function (pi: ExtensionAPI) {
       },
     });
   }
-  for (const [channel, kind] of [["permissions:ready", "permission-ready"], ["permissions:ui_prompt", "permission-prompt"]]) {
-    pi.events.on(channel, () => mark(kind));
-  }
+  pi.events.on("permissions:ready", () => mark("permission-ready"));
+  pi.events.on("permissions:ui_prompt", () => {
+    mark("permission-prompt");
+    if (existsSync(`${dir}/unrelated-decision`)) {
+      // Dispatch after every listener has processed the real prompt.
+      queueMicrotask(() => {
+        pi.events.emit("permissions:decision", { requestId: "unrelated-request-canary" });
+        mark("unrelated decision");
+      });
+    }
+  });
   pi.events.on("permissions:decision", (raw) => {
     const resolution = (raw as { resolution?: string }).resolution;
     // Record status only; never write the rest of the permission payload.

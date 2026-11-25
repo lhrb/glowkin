@@ -1,13 +1,53 @@
+import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { dirname, isAbsolute } from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type RunState = "idle" | "busy" | "done";
-type Signal = RunState | "needs_permission";
+type Attention = "needs_input" | "needs_permission";
+type Signal = RunState | Attention;
+type SocketSource = string | (() => Promise<string | undefined>);
 
-function openPublisher(path: string, pane: string) {
+const runFile = promisify(execFile);
+
+function isSocketPath(path: string): boolean {
+  return isAbsolute(path) && !path.includes("\0") && Buffer.byteLength(path) <= 107;
+}
+
+async function tmuxDiscovery(tmux: string) {
+  // The path itself may contain commas. Resolve only this pane's tmux server.
+  const match = /^(\/.+),([1-9][0-9]*),[0-9]+$/s.exec(tmux);
+  if (!match) return;
+  const [, socket, pid] = match;
+  async function lookup() {
+    try {
+      const { stdout } = await runFile("tmux", ["-N", "-S", socket, "display-message", "-p",
+        "#{pid}:#{start_time}\t#{@glowkin-pi-socket}"], { timeout: 1000, maxBuffer: 4096 });
+      const [generation, endpoint] = stdout.trimEnd().split("\t");
+      if (!generation.startsWith(`${pid}:`) || !endpoint) return;
+      return { generation, endpoint };
+    } catch {
+      return;
+    }
+  }
+  const initial = await lookup();
+  if (!initial) return; // No opt-in: no publisher or retry timer.
+  return async () => {
+    const current = await lookup();
+    if (!current || current.generation !== initial.generation) return;
+    const [encoded, ...identity] = current.endpoint.split(":");
+    if (!/^(?:[0-9a-f]{2})+$/.test(encoded)) return;
+    const path = Buffer.from(encoded, "hex").toString("utf8");
+    if (!isSocketPath(path)) return;
+    const endpoint = await lstat(path, { bigint: true }).catch(() => undefined);
+    if (endpoint?.isSocket() && identity.join(":") === `${endpoint.dev}:${endpoint.ino}:${endpoint.ctimeNs}`) return path;
+  };
+}
+
+function openPublisher(pane: string, path: SocketSource) {
   const instance = randomBytes(16).toString("hex");
   const uid = process.geteuid?.();
   let socket: Socket | undefined;
@@ -31,18 +71,23 @@ function openPublisher(path: string, pane: string) {
 
   async function connect() {
     try {
-      const parent = await lstat(dirname(path));
+      const endpointPath = typeof path === "string" ? path : await path();
+      if (!endpointPath) {
+        scheduleRetry();
+        return;
+      }
+      const parent = await lstat(dirname(endpointPath));
       if (!parent.isDirectory() || parent.uid !== uid || (parent.mode & 0o777) !== 0o700) {
         scheduleRetry();
         return;
       }
-      const endpoint = await lstat(path);
+      const endpoint = await lstat(endpointPath);
       if (stopped) return;
       if (!endpoint.isSocket() || endpoint.uid !== uid) {
         scheduleRetry();
         return;
       }
-      const connection = createConnection({ path });
+      const connection = createConnection({ path: endpointPath });
       socket = connection;
       connection.unref();
       connection.on("error", () => connection.destroy());
@@ -52,7 +97,13 @@ function openPublisher(path: string, pane: string) {
         sent = undefined;
         scheduleRetry();
       });
-      connection.on("connect", () => {
+      connection.on("connect", async () => {
+        // The stable path may have been rebound while connect was in flight.
+        if (typeof path === "function" && await path() !== endpointPath) {
+          connection.destroy();
+          return;
+        }
+        if (stopped || socket !== connection) return;
         writable = true;
         flush();
       });
@@ -81,47 +132,62 @@ function openPublisher(path: string, pane: string) {
   };
 }
 
-function requestId(event: unknown): string | undefined {
-  if (event && typeof event === "object" && "requestId" in event) {
-    return typeof event.requestId === "string" ? event.requestId : undefined;
-  }
-}
-
 export default function (pi: ExtensionAPI) {
-  const pane = process.env.TMUX_PANE;
-  const path = process.env.GLOWKIN_PI_SIGNALS_SOCKET;
-  if (!process.env.TMUX || !pane || !/^%[0-9]{1,10}$/.test(pane)) return;
-  if (!path || !isAbsolute(path) || path.includes("\0") || Buffer.byteLength(path) > 107) return;
+  const { TMUX: tmux, TMUX_PANE: pane, GLOWKIN_PI_SIGNALS_SOCKET: manualPath } = process.env;
+  if (!tmux || !pane || !/^%[0-9]{1,10}$/.test(pane)) return;
+  if (manualPath !== undefined && !isSocketPath(manualPath)) return;
 
   let publisher: ReturnType<typeof openPublisher> | undefined;
+  let shutDown = false;
   let run: RunState = "idle";
   let stoppedNormally = false;
   let completed = false;
-  const prompts = new Set<string>();
-  const publish = () => publisher?.publish(prompts.size ? "needs_permission" : run);
+  const attention = new Map<string, Attention>();
 
-  // gotgenes/pi-permission-system's public channels. Only correlate the opaque
-  // request IDs in memory; an unrelated decision cannot clear an active ask.
-  const unsubscribePrompt = pi.events.on("permissions:ui_prompt", (event) => {
-    if (!publisher) return;
-    const id = requestId(event);
-    if (!id) return;
-    if (run === "done") run = "idle";
-    prompts.add(id);
+  function visibleState(): Signal {
+    for (const state of attention.values()) {
+      if (state === "needs_permission") return state;
+    }
+    return attention.size ? "needs_input" : run;
+  }
+
+  const publish = () => publisher?.publish(visibleState());
+  const unsubscribe = pi.events.on("glowkin:attention", (event) => {
+    if (!event || typeof event !== "object" || Array.isArray(event)) return;
+    const provider: unknown = Object.getOwnPropertyDescriptor(event, "provider")?.value;
+    const state: unknown = Object.getOwnPropertyDescriptor(event, "state")?.value;
+    if (typeof provider !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(provider)) return;
+    if (state === "clear") {
+      if (!attention.delete(provider)) return;
+    } else if (state === "needs_input" || state === "needs_permission") {
+      // Same-category re-reports can announce a new prompt. Supersede any
+      // completion already recorded, but keep tracking future runs underneath.
+      if (run === "done") run = "idle";
+      attention.set(provider, state);
+    } else {
+      return;
+    }
     publish();
   });
-  const unsubscribeDecision = pi.events.on("permissions:decision", (event) => {
-    const id = requestId(event);
-    if (id && prompts.delete(id)) publish();
-  });
 
+  const attach = (path: SocketSource) => {
+    publisher = openPublisher(pane, path);
+    publish(); // Also picks up attention reported by an earlier session_start handler.
+  };
   pi.on("session_start", (_event, ctx) => {
-    if (ctx.mode === "tui") publisher = openPublisher(path, pane);
+    if (ctx.mode !== "tui") return;
+    if (manualPath !== undefined) {
+      attach(manualPath);
+      return;
+    }
+    void tmuxDiscovery(tmux).then((discover) => {
+      if (discover && !shutDown) attach(discover);
+    });
   });
   pi.on("session_shutdown", () => {
-    unsubscribePrompt();
-    unsubscribeDecision();
-    prompts.clear();
+    shutDown = true;
+    unsubscribe();
+    attention.clear();
     publisher?.close();
     publisher = undefined;
   });

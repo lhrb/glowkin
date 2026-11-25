@@ -54,32 +54,44 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mkdir "$root"/{home,runtime}
-cp -- "$src/capture-fixture.ts" "$root/"
+cp -- "$src/"{capture,attention}-fixture.ts "$root/"
 [[ $(cd "$root" && "${clean[@]}" "$pi" --no-extensions --version) == 1.6.0 ]] || fail 'Expected Pi 1.6.0.'
 "${clean[@]}" node -e 'const p = require(process.argv[1]); if (p.name !== "@gotgenes/pi-permission-system" || p.version !== "42.2.1") process.exit(1)' \
   "$permission/package.json" || fail 'Expected installed @gotgenes/pi-permission-system 42.2.1.'
 
 prepare_pane() {
-  local dir=$root/$1 config
+  local dir=$root/$1 mode=$2 config
+  local -a providers=()
   mkdir -p "$dir"/{cwd,home,config,data,state,cache,tmp,agent,sessions}
-  config=$dir/agent/extensions/pi-permission-system
-  mkdir -p "$config"
   printf '%s\n' '{"retry":{"enabled":false}}' > "$dir/agent/settings.json"
-  printf '%s\n' '{"doublePressToConfirm":false,"permissionReviewLog":false,"debugLog":false,"permission":{"*":"deny","fixture_ask":"ask","fixture_silent":"allow"}}' > "$config/config.json"
+  if [[ $mode == permission || $mode == mixed ]]; then
+    config=$dir/agent/extensions/pi-permission-system
+    mkdir -p "$config"
+    printf '%s\n' '{"doublePressToConfirm":false,"permissionReviewLog":false,"debugLog":false,"permission":{"*":"deny","fixture_ask":"ask","fixture_silent":"allow"}}' > "$config/config.json"
+    providers+=(-e "$permission/src/index.ts" -e "$product/permission-system.ts")
+  fi
+  if [[ $mode == generic || $mode == mixed ]]; then
+    providers+=(-e "$root/attention-fixture.ts")
+  fi
   pane_command=(env HOME="$dir/home" TMPDIR="$dir/tmp" XDG_CONFIG_HOME="$dir/config" XDG_DATA_HOME="$dir/data"
     XDG_STATE_HOME="$dir/state" XDG_CACHE_HOME="$dir/cache" PI_CODING_AGENT_DIR="$dir/agent"
     PI_CODING_AGENT_SESSION_DIR="$dir/sessions" GLOWKIN_PI_SIGNALS_SOCKET="$signal_socket" "$pi" --model capture-fixture/fixture
     --no-session --tools fixture_ask,fixture_silent --no-mcp --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files
-    -e "$root/capture-fixture.ts" -e "$permission/src/index.ts" "${capture_args[@]}")
+    -e "$root/capture-fixture.ts" -e "$product/extension.ts" "${providers[@]}")
 }
 record_pid() { pids+=("$(client display-message -p -t "$1" '#{pane_pid}')"); }
 marked() { grep -Fxq -- "$2" "$root/$1/trace" 2>/dev/null; }
 ready_or_failed() { marked "$1" ready || [[ -f $root/$1/preflight-failed ]]; }
 require_ready() {
-  local dir=$1
+  local dir=$1 mode=$2
   wait_for ready_or_failed "$dir" || fail "$dir: fixture did not reach preflight; no input sent."
   [[ ! -f $root/$dir/preflight-failed ]] || fail "$dir: preflight failed ($( < "$root/$dir/preflight-failed" )); no input sent."
-  wait_for marked "$dir" permission-ready || fail "$dir: real permission extension did not start; no input sent."
+  if [[ $mode == permission || $mode == mixed ]]; then
+    wait_for marked "$dir" permission-ready || fail "$dir: real permission extension did not start; no input sent."
+  else
+    [[ ! -e $root/$dir/agent/npm && ! -e $root/$dir/agent/extensions ]] || fail "$dir: isolated Pi has installed packages."
+    ! marked "$dir" permission-ready || fail "$dir: permission package unexpectedly loaded."
+  fi
 }
 mark_wait() { wait_for marked "$1" "$2" || fail "$1: missing fixture milestone '$2'."; }
 view_has() { client capture-pane -p -t "$1" | grep -F -- "$2" >/dev/null; }
@@ -92,30 +104,31 @@ reset_trace() { : > "$root/$1/trace"; rm -f -- "$root/$1/release"; }
 release() { touch "$root/$1/release"; }
 
 start_panes() {
-  prepare_pane left
-  "${clean[@]}" tmux -S "$root/tmux" -f /dev/null new-session -d -s capture -n observed -x 120 -y 40 -c "$root/left/cwd" "${pane_command[@]}" \; set-option -w remain-on-exit on
+  prepare_pane base base
+  "${clean[@]}" tmux -S "$root/tmux" -f /dev/null new-session -d -s capture -n observed -x 120 -y 40 -c "$root/base/cwd" "${pane_command[@]}" \; set-option -w remain-on-exit on
   left=$(client display-message -p -t '=capture:0.0' '#{pane_id}')
   record_pid "$left"
-  prepare_pane right
-  right=$(client split-window -v -d -P -F '#{pane_id}' -t "$left" -c "$root/right/cwd" "${pane_command[@]}")
+  prepare_pane generic generic
+  right=$(client split-window -v -d -P -F '#{pane_id}' -t "$left" -c "$root/generic/cwd" "${pane_command[@]}")
   record_pid "$right"
   [[ -S $root/tmux && $(client list-sessions -F '#{session_attached}') == 0 && $left != "$right" &&
     $(client display-message -p -t "$left" '#{window_id}') == "$(client display-message -p -t "$right" '#{window_id}')" ]] \
     || fail 'Expected two panes in the same detached private tmux window.'
-  require_ready left
-  require_ready right
+  require_ready base base
+  require_ready generic generic
 }
-respawn_right() {
-  local instance=$1
-  prepare_pane "$instance"
-  client respawn-pane -t "$right" -c "$root/$instance/cwd" "${pane_command[@]}"
-  record_pid "$right"
-  require_ready "$instance"
+pane_dead() { [[ $(client display-message -p -t "$1" '#{pane_dead}') == 1 ]]; }
+respawn() {
+  local pane=$1 instance=$2 mode=${3:-permission}
+  wait_for pane_dead "$pane" || fail "$pane: tmux did not mark the exited Pi pane dead."
+  prepare_pane "$instance" "$mode"
+  client respawn-pane -t "$pane" -c "$root/$instance/cwd" "${pane_command[@]}"
+  record_pid "$pane"
+  require_ready "$instance" "$mode"
 }
 
 # Exercise the shipped receiver and chooser on the same private server.
-(cd "$root" && "${clean[@]}" cargo build --quiet --locked --offline --manifest-path "$product/Cargo.toml" --target-dir "$root/target")
-capture_args=(-e "$product/extension.ts")
+cargo build --quiet --locked --manifest-path "$product/Cargo.toml" --target-dir "$root/target"
 start_panes
 client source-file "$product/chooser.tmux"
 plain=$(client new-window -d -n plain -P -F '#{pane_id}' sleep 300)
@@ -130,7 +143,8 @@ attach_chooser() {
   # Use a second private server as the terminal so capture-pane sees the rendered chooser.
   "${clean[@]}" tmux -S "$root/view" -f /dev/null new-session -d -x 120 -y 40 \
     "${clean[@]}" TERM=xterm-256color tmux -N -S "$root/tmux" attach -t '=capture'
-  pids+=("$(viewer display-message -p '#{pane_pid}')")
+  chooser_pid=$(viewer display-message -p '#{pane_pid}')
+  pids+=("$chooser_pid")
   wait_for client_attached || fail 'Private chooser client did not attach.'
   viewer send-keys C-b w
 }
@@ -149,14 +163,14 @@ expect_chooser() {
 }
 detach_chooser() {
   client detach-client -t "$chooser_client"
-  wait_for gone "${pids[-1]}" || fail 'Private chooser client did not exit.'
+  wait_for gone "$chooser_pid" || fail 'Private chooser client did not exit.'
   viewer kill-server >/dev/null 2>&1 || true
 }
 
 
 last_signal() { awk -F '\t' -v pane="$1" '$1 == pane {line=$0} END {print line}' "$signals"; }
 latest_is() { [[ $(last_signal "$1") == *$'\t'"$2" ]]; }
-await_state() { wait_for latest_is "$1" "$2" || fail "$1: expected latest signal '$2'."; }
+await_state() { wait_for latest_is "$1" "$2" || fail "$1: expected '$2', last frame: $(last_signal "$1")"; }
 instance() { last_signal "$1" | cut -f2; }
 begin() { reset_trace "$1"; first_line=$(wc -l < "$signals"); }
 state_count() {
@@ -175,6 +189,92 @@ expect_count "$right" done 0
 printf 'Startup: %s and %s are independently idle.\n' "$left" "$right"
 attach_chooser
 expect_chooser idle
+
+begin base
+submit "$left" 'follow-up fixture-prompt-canary'
+mark_wait base 'final request'
+await_state "$left" busy
+expect_chooser busy
+release base
+end_run base "$left"
+expect_chooser done
+printf 'Core alone in an isolated Pi: [idle] → [busy] → [done].\n'
+
+attention() {
+  submit "$2" "/fixture-attention $3"
+  mark_wait "$1" "attention $3"
+}
+begin generic
+submit "$right" 'normal fixture-prompt-canary'
+end_run generic "$right"
+attention generic "$right" malformed
+attention generic "$right" 'absent clear'
+attention generic "$right" 'primary needs_input'
+await_state "$right" needs_input
+expect_chooser 'needs input'
+attention generic "$right" 'secondary needs_permission'
+await_state "$right" needs_permission
+expect_chooser permission
+attention generic "$right" 'secondary clear'
+await_state "$right" needs_input
+expect_chooser 'needs input'
+attention generic "$right" 'primary clear'
+await_state "$right" idle
+expect_chooser done # Left retains its own done; right must not revive its old done.
+expect_count "$right" done 1
+expect_count "$right" needs_input 2
+expect_count "$right" needs_permission 1
+expect_count "$right" idle 1
+
+begin generic
+attention generic "$right" 'primary needs_input'
+await_state "$right" needs_input
+attention generic "$right" 'secondary needs_input'
+reset_trace base
+submit "$left" 'follow-up fixture-prompt-canary'
+await_state "$left" busy
+expect_chooser 'needs input'
+release base
+await_state "$left" done
+submit "$right" 'normal fixture-prompt-canary'
+mark_wait generic 'settled normal'
+attention generic "$right" 'primary clear'
+attention generic "$right" 'secondary clear'
+await_state "$right" done
+expect_count "$right" done 1
+expect_count "$right" needs_input 1
+expect_count "$right" busy 0
+expect_chooser done
+
+begin generic
+attention generic "$right" 'primary needs_permission'
+await_state "$right" needs_permission
+submit "$right" 'normal fixture-prompt-canary'
+mark_wait generic 'settled normal'
+# A provider can report a new prompt even if its aggregated category is unchanged.
+reset_trace generic
+attention generic "$right" 'primary needs_permission'
+attention generic "$right" 'primary clear'
+await_state "$right" idle
+expect_count "$right" done 0
+printf 'Independent attention survives another provider clearing; permission wins; malformed events are ignored; a new prompt invalidates done even at the same category.\n'
+
+begin generic
+attention generic "$right" 'primary needs_input'
+await_state "$right" needs_input
+expect_chooser 'needs input'
+kill -KILL "$(client display-message -p -t "$right" '#{pane_pid}')"
+await_state "$right" gone
+expect_chooser done
+client send-keys -t "$left" C-d
+await_state "$left" gone
+expect_chooser ''
+respawn "$left" left
+respawn "$right" right
+await_state "$left" idle
+await_state "$right" idle
+expect_chooser idle
+printf 'Killing a pane with generic attention removes its label without running shutdown hooks.\n'
 
 begin left
 ask left "$left"
@@ -271,7 +371,7 @@ replace_right() {
   wait_for gone "$pid" || fail 'Killed fixture Pi did not exit.'
   await_state "$right" gone
   [[ $(instance "$right") == "$old_id" ]] || fail 'Disconnect was attributed to the wrong instance.'
-  respawn_right "$new"
+  respawn "$right" "$new"
   await_state "$right" idle
   [[ $(instance "$right") != "$old_id" ]] || fail 'Replacement Pi reused the prior source ID.'
 }
@@ -303,7 +403,7 @@ printf 'Chooser suffix expires without receiver updates and disappears after the
 stop_receiver
 rm -f -- "$signal_socket"
 [[ ! -e $signal_socket ]] || fail 'Receiver socket still exists during the absent-receiver check.'
-respawn_right absent
+respawn "$right" absent
 ask absent "$right"
 client send-keys -t "$right" y
 mark_wait absent 'decision user_approved'
@@ -331,15 +431,30 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
 PY
 receiver_pid=$!
 wait_for test -S "$signal_socket" || fail 'Raw Unix socket did not start.'
-respawn_right wire
-wire_has() { grep -q $'\t'"$1"'$' "$raw" 2>/dev/null; }
-wait_for wire_has idle || fail 'Publisher did not send startup idle to the raw Unix socket.'
+respawn "$right" wire mixed
+wire_is() { [[ $(tail -n1 "$raw" 2>/dev/null) == *$'\t'"$1" ]]; }
+await_wire() { wait_for wire_is "$1" || fail "Publisher did not send '$1' to the raw Unix socket."; }
+await_wire idle
+submit "$right" 'follow-up fixture-prompt-canary'
+await_wire busy
+release wire
+await_wire done
+reset_trace wire
+attention wire "$right" 'primary needs_input'
+await_wire needs_input
+touch "$root/wire/unrelated-decision"
 ask wire "$right"
+mark_wait wire 'unrelated decision'
+await_wire needs_permission
+sleep 0.2 # Let the publisher drain before resolving the still-open prompt.
+wire_is needs_permission || fail 'An unrelated decision cleared the real prompt.'
 client send-keys -t "$right" y
 mark_wait wire 'decision user_approved'
+await_wire needs_input
 release wire
 mark_wait wire 'settled normal'
-wait_for wire_has done || fail 'Publisher did not send done to the raw Unix socket.'
+attention wire "$right" 'primary clear'
+await_wire done
 client send-keys -t "$right" C-d
 wait_for gone "$receiver_pid" || fail 'Raw socket did not reach EOF after Pi exited.'
 wait "$receiver_pid"
@@ -352,16 +467,17 @@ from pathlib import Path
 raw = Path(sys.argv[2]).read_bytes()
 rows = raw.splitlines(keepends=True)
 pane = re.escape(sys.argv[1].encode())
-pattern = pane + rb'\t([0-9a-f]{32})\t(idle|busy|needs_permission|done)\n'
+pattern = pane + rb'\t([0-9a-f]{32})\t(idle|busy|needs_input|needs_permission|done)\n'
 frames = [re.fullmatch(pattern, row) for row in rows]
 assert rows and all(frames), 'Publisher leaked extra fields, bytes, or non-opaque identifiers'
 assert len({frame[1] for frame in frames}) == 1, 'Publisher changed instance mid-session'
-assert {frame[2] for frame in frames} == {b'idle', b'busy', b'needs_permission', b'done'}, 'Missing wire states'
+assert [frame[2] for frame in frames] == b'idle busy done needs_input needs_permission needs_input done'.split(), 'Unexpected producer transitions'
 received = Path(sys.argv[4]).read_bytes().splitlines(keepends=True)
 panes = b'(?:' + pane + b'|' + re.escape(sys.argv[3].encode()) + b')'
-assert all(re.fullmatch(panes + rb'\t[0-9a-f]{32}\t(idle|busy|needs_permission|done|gone)\n', row)
+assert all(re.fullmatch(panes + rb'\t[0-9a-f]{32}\t(idle|busy|needs_input|needs_permission|done|gone)\n', row)
            for row in received), 'Receiver output violated the TSV contract'
 PY
+printf 'A real permission prompt beats simultaneous generic attention, ignores an unrelated decision, and clears to needs_input on its matching decision.\n'
 printf 'Raw producer bytes and receiver output contain only pane ID, opaque instance ID, and state.\n'
 printf '\nReceiver output (isolated run):\n'
 "${clean[@]}" awk '1' "$signals"

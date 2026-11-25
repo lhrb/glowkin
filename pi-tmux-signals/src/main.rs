@@ -1,4 +1,5 @@
 mod chooser;
+mod startup;
 
 use chooser::Chooser;
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ fn read_signal(reader: &mut impl BufRead) -> Option<(Source, &'static str)> {
         "idle" => "idle",
         "busy" => "busy",
         "needs_permission" => "needs_permission",
+        "needs_input" => "needs_input",
         "done" => "done",
         _ => return None,
     };
@@ -159,8 +161,11 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-fn receive(path: &Path, mut chooser: Option<Chooser>) -> io::Result<()> {
-    let listener = bind(path)?;
+fn receive(
+    listener: UnixListener,
+    mut chooser: Option<Chooser>,
+    print_events: bool,
+) -> io::Result<()> {
     if let Some(chooser) = &mut chooser {
         chooser.refresh();
     }
@@ -182,9 +187,13 @@ fn receive(path: &Path, mut chooser: Option<Chooser>) -> io::Result<()> {
     });
 
     let mut panes = Panes::default();
-    let mut stdout = io::stdout().lock();
-    loop {
-        let event = match chooser.as_mut().and_then(Chooser::wait) {
+    let mut stdout = print_events.then(|| io::stdout().lock());
+    while !startup::stopping() {
+        let timeout = match &mut chooser {
+            Some(chooser) => chooser.wait()?,
+            None => None,
+        };
+        let event = match timeout {
             Some(timeout) => match incoming.recv_timeout(timeout) {
                 Ok(event) => event,
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -196,8 +205,10 @@ fn receive(path: &Path, mut chooser: Option<Chooser>) -> io::Result<()> {
             },
         };
         if let Some((source, state)) = panes.observe(event)? {
-            writeln!(stdout, "{}\t{}\t{state}", source.pane, source.instance)?;
-            stdout.flush()?;
+            if let Some(stdout) = &mut stdout {
+                writeln!(stdout, "{}\t{}\t{state}", source.pane, source.instance)?;
+                stdout.flush()?;
+            }
             if let Some(chooser) = &mut chooser {
                 chooser.observe(source.pane, state);
             }
@@ -210,10 +221,21 @@ fn main() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
     let usage = || {
         io::Error::other(
-            "usage: pi-tmux-signals /absolute/private-directory/signals.sock [--tmux-socket /absolute/tmux/socket]",
+            "usage: pi-tmux-signals SIGNAL_SOCKET [--tmux-socket TMUX_SOCKET]\n       pi-tmux-signals --serve SIGNAL_SOCKET TMUX_SOCKET PID:START_TIME",
         )
     };
     let path = args.next().ok_or_else(usage)?;
+    if path == "--serve" {
+        let path = args.next().ok_or_else(usage)?;
+        let socket = args.next().ok_or_else(usage)?;
+        let generation = args
+            .next()
+            .and_then(|arg| arg.into_string().ok())
+            .filter(|_| args.next().is_none())
+            .ok_or_else(usage)?;
+        let chooser = Chooser::start(Path::new(&socket), Some(&generation))?;
+        return startup::serve(Path::new(&path), chooser);
+    }
     let chooser = match args.next() {
         None => None,
         Some(flag) if flag == "--tmux-socket" => {
@@ -221,11 +243,11 @@ fn main() -> io::Result<()> {
                 .next()
                 .filter(|_| args.next().is_none())
                 .ok_or_else(usage)?;
-            Some(Chooser::start(Path::new(&socket))?)
+            Some(Chooser::start(Path::new(&socket), None)?)
         }
         _ => return Err(usage()),
     };
-    match receive(Path::new(&path), chooser) {
+    match receive(bind(Path::new(&path))?, chooser, true) {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }
@@ -240,15 +262,19 @@ mod tests {
 
     #[test]
     fn accepts_only_complete_state_frames() {
-        let valid = format!("%0\t{OLD}\tneeds_permission\n");
-        assert_eq!(
-            read_signal(&mut valid.as_bytes()).unwrap().1,
-            "needs_permission"
-        );
+        for state in ["idle", "busy", "done", "needs_input", "needs_permission"] {
+            let valid = format!("%1234567890\t{OLD}\t{state}\n");
+            assert_eq!(
+                read_signal(&mut valid.as_bytes()).map(|(_, state)| state),
+                Some(state)
+            );
+        }
         for invalid in [
             format!("%0\t{OLD}\tidle"),
             format!("%0\t{OLD}\tgone\n"),
             format!("%0\t{OLD}\tidle\textra\n"),
+            format!("%0\t{OLD}\tneeds input\n"),
+            format!("%0\t{OLD}\tneeds_input\tprovider-key\n"),
             format!("%0\t{OLD}\t{}\n", "x".repeat(64)),
             format!("\x1b[0m\t{OLD}\tidle\n"),
             "%0\tsession/path\tidle\n".into(),
