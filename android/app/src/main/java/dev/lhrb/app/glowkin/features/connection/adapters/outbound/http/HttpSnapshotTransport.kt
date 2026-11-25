@@ -40,12 +40,7 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
             .toString().toByteArray(Charsets.UTF_8)
         val connection = connection(endpoint, "/v1/workspace/open-shell")
         try {
-            connection.requestMethod = "POST"
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json")
-            // Streaming disables HttpURLConnection's transparent replay of a buffered POST.
-            connection.setFixedLengthStreamingMode(body.size)
-            connection.outputStream.use { it.write(body) }
+            connection.postJson(body)
             return when (connection.responseCode) {
                 204 -> ChangeOutcome.APPLIED
                 409 -> ChangeOutcome.TARGET_UNAVAILABLE
@@ -57,6 +52,41 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
         } finally {
             connection.disconnect()
         }
+    }
+
+    fun readPane(endpoint: Endpoint, target: PaneTarget): PaneRead {
+        val body = JSONObject().put("sessionId", target.session.id).put("generation", target.session.generation)
+            .put("windowId", target.windowId).put("paneId", target.paneId)
+            .toString().toByteArray(Charsets.UTF_8)
+        val connection = connection(endpoint, "/v1/workspace/read-pane")
+        try {
+            connection.setRequestProperty("Accept", "text/plain")
+            connection.setRequestProperty("Cache-Control", "no-cache, no-store")
+            connection.postJson(body)
+            return when (connection.responseCode) {
+                200 -> {
+                    if (connection.contentType?.substringBefore(';')?.trim() != "text/plain") return PaneRead.Failed
+                    PaneRead.Captured(connection.inputStream.use { it.readBytesBounded() }.toString(Charsets.UTF_8))
+                }
+                409 -> PaneRead.TargetUnavailable
+                else -> PaneRead.Failed
+            }
+        } catch (_: IOException) {
+            return PaneRead.Failed
+        } catch (_: ConnectionFailure) {
+            return PaneRead.Failed
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun HttpURLConnection.postJson(body: ByteArray) {
+        requestMethod = "POST"
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json")
+        // Streaming disables HttpURLConnection's transparent replay of a buffered POST.
+        setFixedLengthStreamingMode(body.size)
+        outputStream.use { it.write(body) }
     }
 
     private fun connection(endpoint: Endpoint, path: String): HttpURLConnection {
@@ -166,14 +196,16 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
     private fun JsonReader.readWindow(): WorkspaceWindow {
         var id: String? = null
         var name: String? = null
+        var paneId: String? = null
         readFields { field ->
             when (field) {
                 "id" -> id = readString()
                 "name" -> name = readString()
+                "paneId" -> paneId = requireId(readString())
                 else -> skipValue()
             }
         }
-        return WorkspaceWindow(requireId(id), requireString(name))
+        return WorkspaceWindow(requireId(id), requireString(name), paneId)
     }
 
     private inline fun JsonReader.readFields(read: (String) -> Unit) {

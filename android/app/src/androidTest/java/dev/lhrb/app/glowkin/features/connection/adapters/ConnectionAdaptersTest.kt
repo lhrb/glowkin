@@ -64,6 +64,27 @@ class ConnectionAdaptersTest {
         }
     }
 
+    @Test fun paneAdapterPreservesPlainTextAndBoundsStreamedBodies() {
+        val exactLimit = "x".repeat(65536)
+        val requests = mutableListOf<String>()
+        val target = PaneTarget(SessionTarget("\$0", "123-456"), "@1", "%2")
+        serve(listOf(200 to "", 200 to "one\n    two\n", 200 to exactLimit, 200 to "$exactLimit!", 409 to ""),
+            requests, contentType = "text/plain; charset=utf-8", chunked = true) { endpoint ->
+            val transport = HttpSnapshotTransport(timeoutMillis = 1500)
+            assertEquals(PaneRead.Captured(""), transport.readPane(endpoint, target))
+            assertEquals(PaneRead.Captured("one\n    two\n"), transport.readPane(endpoint, target))
+            assertEquals(PaneRead.Captured(exactLimit), transport.readPane(endpoint, target))
+            assertEquals(PaneRead.Failed, transport.readPane(endpoint, target))
+            assertEquals(PaneRead.TargetUnavailable, transport.readPane(endpoint, target))
+        }
+        assertEquals(5, requests.size)
+        for (request in requests) {
+            assertEquals("POST /v1/workspace/read-pane HTTP/1.1", request.lineSequence().first())
+            assertTrue(request.contains("Accept: text/plain", ignoreCase = true))
+            assertTrue(request.contains("Cache-Control: no-cache, no-store", ignoreCase = true))
+        }
+    }
+
     @Test fun refusedConnectionMapsToActionableUnreachableError() {
         val port = ServerSocket(0).use { it.localPort }
         expectFailure(ConnectionError.UNREACHABLE) {
@@ -84,6 +105,8 @@ class ConnectionAdaptersTest {
     private fun serve(
         responses: List<Pair<Int, String>>,
         requests: MutableList<String> = mutableListOf(),
+        contentType: String = "application/json",
+        chunked: Boolean = false,
         block: (Endpoint) -> Unit
     ) {
         ServerSocket(0).use { server ->
@@ -101,11 +124,23 @@ class ConnectionAdaptersTest {
                             lines += line
                         }
                         requests += lines.joinToString("\r\n")
+                        val length = lines.firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+                            ?.substringAfter(':')?.trim()?.toInt() ?: 0
+                        repeat(length) { check(reader.read() >= 0) } // Fixture POST bodies are ASCII.
                         val bytes = body.toByteArray(Charsets.UTF_8)
-                        val header = "HTTP/1.1 $status Response\r\nContent-Type: application/json\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                        val framing = if (chunked) "Transfer-Encoding: chunked" else "Content-Length: ${bytes.size}"
+                        val header = "HTTP/1.1 $status Response\r\nContent-Type: $contentType\r\n$framing\r\nConnection: close\r\n\r\n"
                         client.getOutputStream().apply {
                             write(header.toByteArray(Charsets.US_ASCII))
-                            write(bytes)
+                            if (chunked) {
+                                for (offset in bytes.indices step 4096) {
+                                    val size = minOf(4096, bytes.size - offset)
+                                    write("${size.toString(16)}\r\n".toByteArray())
+                                    write(bytes, offset, size)
+                                    write("\r\n".toByteArray())
+                                }
+                                write("0\r\n\r\n".toByteArray())
+                            } else write(bytes)
                             flush()
                         }
                     }

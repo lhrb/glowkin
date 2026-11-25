@@ -10,8 +10,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
+data class PanePreview(val target: PaneTarget? = null, val text: String? = null, val error: String? = null)
+
 /** One worker serializes persistence and HTTP. Epochs discard obsolete lifecycle/UI deliveries. */
-class ConnectionModule(context: Context, private val render: (ConnectionState, String?, Boolean) -> Unit) {
+class ConnectionModule(context: Context, private val render: (ConnectionState, String?, Boolean, PanePreview) -> Unit) {
     private val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
     private val worker = Executors.newSingleThreadScheduledExecutor()
     private val main = Handler(Looper.getMainLooper())
@@ -21,6 +23,10 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
     private var foreground = false
     private var wanted = true
     private var openingShell = false
+    // Each selection is distinct, even A → B → A while the first A is in flight.
+    private class Selection(val target: PaneTarget)
+    @Volatile private var selection: Selection? = null
+    private var preview = PanePreview()
     private val transport = HttpSnapshotTransport()
 
     init {
@@ -46,7 +52,7 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
 
     fun disconnect() {
         wanted = false
-        invalidate()
+        invalidate(forgetPane = true)
     }
 
     fun retry() {
@@ -58,7 +64,7 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         // Validate before disturbing the currently configured connection.
         val endpoint = Endpoint.parse(host, port)
         wanted = true
-        invalidate()
+        invalidate(forgetPane = true)
         val token = epoch
         worker.execute {
             if (token != epoch) return@execute
@@ -72,13 +78,20 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         }
     }
 
+    fun selectPane(shown: ConnectionState, target: PaneTarget) {
+        if (!foreground || !wanted || !shown.canRead(target)) return
+        selection = Selection(target)
+        preview = PanePreview(target)
+        render(shown, null, openingShell, preview)
+    }
+
     fun openShell(shown: ConnectionState) {
         val endpoint = shown.endpoint ?: return
         val target = shown.shellTarget ?: return
         if (!foreground || !wanted || openingShell) return
         val token = epoch
         openingShell = true
-        render(shown, null, true)
+        render(shown, null, true, preview)
         worker.execute {
             if (token != epoch) return@execute
             val connection = useCase!!
@@ -98,14 +111,16 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         }
     }
 
-    private fun invalidate() {
+    private fun invalidate(forgetPane: Boolean = false) {
         epoch++
         openingShell = false
         polling?.cancel(false)
         polling = null
+        if (forgetPane) selection = null
+        preview = PanePreview(selection?.target)
         useCase?.let {
             it.disconnect() // No I/O; invalidates even a currently blocked HTTP response.
-            if (foreground) render(it.state, null, false)
+            render(it.state, null, false, preview)
         }
     }
 
@@ -128,8 +143,28 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
                 // The worker is serial, so no newer request can be invalidated here.
                 if (token != epoch) connection.disconnect()
                 publish(token)
+                readPreview(token, connection.state)
             }
         }, 0, 2, TimeUnit.SECONDS)
+    }
+
+    private fun readPreview(token: Long, state: ConnectionState) {
+        val chosen = selection ?: return
+        val endpoint = state.endpoint ?: return
+        if (token != epoch || !state.canRead(chosen.target)) return
+        val result = transport.readPane(endpoint, chosen.target)
+        main.post {
+            if (token != epoch || !foreground || selection !== chosen) return@post
+            preview = when (result) {
+                is PaneRead.Captured -> PanePreview(chosen.target, text = result.text)
+                PaneRead.Failed -> PanePreview(chosen.target, error = "Cannot read this pane. Retrying while selected.")
+                PaneRead.TargetUnavailable -> {
+                    selection = null
+                    PanePreview(error = "Pane is no longer available. Select a window again.")
+                }
+            }
+            render(state, null, openingShell, preview)
+        }
     }
 
     private fun publish(token: Long, error: String? = null, connecting: Boolean = false, finishedOpening: Boolean = false) {
@@ -139,7 +174,11 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         main.post {
             if (token == epoch && foreground) {
                 if (finishedOpening) openingShell = false
-                render(state, error, openingShell)
+                if (!connecting && selection?.let { !state.canRead(it.target) } == true) {
+                    selection = null
+                    preview = PanePreview(error = "Pane is no longer available. Select a window again.")
+                }
+                render(state, error, openingShell, preview)
             }
         }
     }

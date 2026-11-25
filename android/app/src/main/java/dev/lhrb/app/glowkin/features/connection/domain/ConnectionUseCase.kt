@@ -13,7 +13,14 @@ sealed interface Workspace {
 }
 
 data class SessionTarget(val id: String, val generation: String)
-data class WorkspaceWindow(val id: String, val name: String)
+data class WorkspaceWindow(val id: String, val name: String, val paneId: String? = null)
+data class PaneTarget(val session: SessionTarget, val windowId: String, val paneId: String)
+
+sealed interface PaneRead {
+    data class Captured(val text: String) : PaneRead
+    data object TargetUnavailable : PaneRead
+    data object Failed : PaneRead
+}
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED }
 enum class ConnectionError { UNREACHABLE, PROTOCOL }
 class ConnectionFailure(val error: ConnectionError) : Exception(error.name)
@@ -31,6 +38,19 @@ data class ConnectionState(
     val shellTarget: SessionTarget?
         get() = (snapshot?.workspace as? Workspace.Ready)?.target
             ?.takeIf { status == ConnectionStatus.CONNECTED && !stale && !needsReconciliation }
+
+    fun paneTarget(window: WorkspaceWindow): PaneTarget? {
+        val workspace = snapshot?.workspace as? Workspace.Ready ?: return null
+        val pane = window.paneId ?: return null
+        if (status != ConnectionStatus.CONNECTED || stale || window !in workspace.windows) return null
+        return PaneTarget(workspace.target, window.id, pane)
+    }
+
+    fun canRead(target: PaneTarget): Boolean {
+        val workspace = snapshot?.workspace as? Workspace.Ready ?: return false
+        return status == ConnectionStatus.CONNECTED && !stale && workspace.target == target.session &&
+            workspace.windows.any { it.id == target.windowId && it.paneId == target.paneId }
+    }
 }
 
 /** Blocking ports belong on a worker. Invalidation never waits for an in-flight read. */

@@ -1,9 +1,11 @@
 package dev.lhrb.app.glowkin
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -12,9 +14,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import dev.lhrb.app.glowkin.features.connection.ConnectionModule
+import dev.lhrb.app.glowkin.features.connection.PanePreview
 import dev.lhrb.app.glowkin.features.connection.domain.*
 import dev.lhrb.app.glowkin.ui.theme.GlowkinTheme
 
@@ -23,19 +27,27 @@ class MainActivity : ComponentActivity() {
     private var state by mutableStateOf(ConnectionState())
     private var storageError by mutableStateOf<String?>(null)
     private var openingShell by mutableStateOf(false)
+    private var preview by mutableStateOf(PanePreview())
+    private var previewProtected = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        connection = ConnectionModule(applicationContext) { current, error, opening ->
+        connection = ConnectionModule(applicationContext) { current, error, opening, pane ->
+            if (pane.text?.isNotBlank() == true && !previewProtected) {
+                // Keep protection until destruction so a frame with old pixels cannot be saved.
+                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                previewProtected = true
+            }
             state = current
             storageError = error
             openingShell = opening
+            preview = pane
         }
         setContent {
             GlowkinTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    ConnectionScreen(state, storageError, openingShell, connection, Modifier.padding(padding))
+                    ConnectionScreen(state, storageError, openingShell, preview, connection, Modifier.padding(padding))
                 }
             }
         }
@@ -47,7 +59,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ConnectionScreen(state: ConnectionState, storageError: String?, openingShell: Boolean, connection: ConnectionModule, modifier: Modifier) {
+private fun ConnectionScreen(state: ConnectionState, storageError: String?, openingShell: Boolean, preview: PanePreview, connection: ConnectionModule, modifier: Modifier) {
     var host by rememberSaveable { mutableStateOf("") }
     var port by rememberSaveable { mutableStateOf("8787") }
     var inputError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -84,14 +96,14 @@ private fun ConnectionScreen(state: ConnectionState, storageError: String?, open
             Text(if (state.stale) "Stale snapshot — not current PC state" else "Current bridge snapshot")
             Text("Bridge revision: ${it.revision}")
         }
-        if (state.snapshot != null) WorkspaceSection(state, openingShell, connection)
+        if (state.snapshot != null) WorkspaceSection(state, openingShell, preview, connection)
         Text("Disconnection does not stop PC work or confirm whether a command succeeded.")
-        Text("Unauthenticated HTTP PC control: use trusted networks only. WLAN alone does not authorize peers. Restrict access with firewall or Tailscale policy; never expose publicly.")
+        Text("Unauthenticated HTTP PC control: use trusted networks only. Any reachable peer can read eligible panes on bridges that support pane reading. WLAN alone does not authorize peers. Restrict access with firewall or Tailscale policy; never expose publicly.")
     }
 }
 
 @Composable
-private fun WorkspaceSection(state: ConnectionState, openingShell: Boolean, connection: ConnectionModule) {
+private fun WorkspaceSection(state: ConnectionState, openingShell: Boolean, preview: PanePreview, connection: ConnectionModule) {
     Text("tmux workspace", style = MaterialTheme.typography.titleLarge)
     val workspace = state.snapshot?.workspace
     if (workspace != null) {
@@ -115,11 +127,33 @@ private fun WorkspaceSection(state: ConnectionState, openingShell: Boolean, conn
     when (workspace) {
         is Workspace.Ready -> {
             Text("Session: ${workspace.name}")
-            workspace.windows.forEach { Text(it.name) }
+            workspace.windows.forEach { window ->
+                val target = state.paneTarget(window)
+                if (target == null) {
+                    Text(window.name)
+                } else {
+                    TextButton(onClick = { connection.selectPane(state, target) }) { Text(window.name) }
+                    if (preview.target == target) PanePreviewPanel(preview)
+                }
+            }
         }
         Workspace.NoSession -> Text("Start a tmux session on the PC to see its windows here.")
         Workspace.MultipleSessions -> Text("Glowkin supports one tmux session at a time. Manage sessions on the PC.")
         Workspace.Unavailable -> Text("Cannot read tmux. Check that tmux and a session are running on the PC.")
         null -> Text("This bridge does not report tmux windows. Update the bridge to use workspace controls.")
+    }
+    if (preview.target == null) preview.error?.let { Text(it) }
+}
+
+@Composable
+private fun PanePreviewPanel(preview: PanePreview) {
+    Text("Selected pane", style = MaterialTheme.typography.titleSmall)
+    val text = preview.text
+    when {
+        preview.error != null -> Text(preview.error)
+        text == null -> Text("Reading pane…")
+        text.isBlank() -> Text("Pane is blank.")
+        else -> Text(text, fontFamily = FontFamily.Monospace, softWrap = false,
+            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()))
     }
 }
