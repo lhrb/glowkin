@@ -1,3 +1,6 @@
+mod chooser;
+
+use chooser::Chooser;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -5,7 +8,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::thread;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -156,8 +159,11 @@ fn bind(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-fn receive(path: &Path) -> io::Result<()> {
+fn receive(path: &Path, mut chooser: Option<Chooser>) -> io::Result<()> {
     let listener = bind(path)?;
+    if let Some(chooser) = &mut chooser {
+        chooser.refresh();
+    }
     let (events, incoming) = mpsc::sync_channel(64);
     thread::spawn(move || {
         for (connection, stream) in (0..).zip(listener.incoming()) {
@@ -177,10 +183,24 @@ fn receive(path: &Path) -> io::Result<()> {
 
     let mut panes = Panes::default();
     let mut stdout = io::stdout().lock();
-    for event in incoming {
+    loop {
+        let event = match chooser.as_mut().and_then(Chooser::wait) {
+            Some(timeout) => match incoming.recv_timeout(timeout) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match incoming.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
         if let Some((source, state)) = panes.observe(event)? {
             writeln!(stdout, "{}\t{}\t{state}", source.pane, source.instance)?;
             stdout.flush()?;
+            if let Some(chooser) = &mut chooser {
+                chooser.observe(source.pane, state);
+            }
         }
     }
     Ok(())
@@ -188,13 +208,24 @@ fn receive(path: &Path) -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let mut args = env::args_os().skip(1);
-    let path = args
-        .next()
-        .filter(|_| args.next().is_none())
-        .ok_or_else(|| {
-            io::Error::other("usage: pi-tmux-signals /absolute/private-directory/signals.sock")
-        })?;
-    match receive(Path::new(&path)) {
+    let usage = || {
+        io::Error::other(
+            "usage: pi-tmux-signals /absolute/private-directory/signals.sock [--tmux-socket /absolute/tmux/socket]",
+        )
+    };
+    let path = args.next().ok_or_else(usage)?;
+    let chooser = match args.next() {
+        None => None,
+        Some(flag) if flag == "--tmux-socket" => {
+            let socket = args
+                .next()
+                .filter(|_| args.next().is_none())
+                .ok_or_else(usage)?;
+            Some(Chooser::start(Path::new(&socket))?)
+        }
+        _ => return Err(usage()),
+    };
+    match receive(Path::new(&path), chooser) {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }
