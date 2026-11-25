@@ -2,16 +2,14 @@
 
 ## Scope and security
 
-The bridge snapshot reports bridge identity and tmux workspace state.
-Android can list windows and open a shell in one existing tmux session on the configured server.
-It cannot create sessions, close windows, or attach to pi.
-A connected screen establishes bridge reachability, not agent availability.
-The opaque revision identifies the bridge process lifetime; it is not an ordered counter.
-Future inventory must extend the authoritative snapshot rather than infer agent state from connectivity.
+Android can list windows, open a shell, and read the visible screen of an eligible pane in one existing tmux session on the configured server.
+It cannot send pane input, create sessions, close windows, or control Pi.
+Connected means the bridge is reachable, not that an agent is available.
 
 HTTP address-only access is **unauthenticated PC control for trusted networks only**.
 There is no login, pairing, token, TLS, or application-level authorization.
-Any reachable peer can read the window list and request a new shell window when exactly one session is available.
+**Any reachable peer can read eligible pane contents without the Android app.**
+Reachable peers can also read the window list and request a new shell window when exactly one session is available.
 WLAN alone does not authorize peers.
 Do not forward this port publicly or deploy behind a public ingress.
 Restrict the listener and firewall to intended peers; restrict Tailscale access with tailnet policy.
@@ -22,11 +20,13 @@ Do not change global firewall policy merely to make this example work.
 ## Try the single-session workflow
 
 1. On the PC, start `tmux` if needed and leave exactly one session running. Create a window with `Ctrl+b c`.
-2. From the repository root, run `./server/run-server.sh --bind <trusted PC IP>`, replacing the placeholder with the PC's trusted WLAN or Tailscale IP. The script builds and runs the release bridge with Cargo and forwards bridge flags. Omit `--bind` for loopback only.
+2. From the repository root, run `./server/run-server.sh --bind 192.168.1.10`, replacing the example address with the PC's trusted WLAN or Tailscale IP. The script builds and runs the release bridge with Cargo and forwards bridge flags. Omit `--bind` for loopback only.
 3. If needed, install the debug app on the connected Android device from the repository root: `cd android && ./gradlew :app:installDebug` (requires compile SDK 37).
 4. In Glowkin, enter the PC IP and port `8787`, then tap **Save and connect** or **Replace and connect**. Under **tmux workspace**, tap **Refresh** to check for PC-created windows. Tap **Open shell** and check on the PC that a new interactive shell opened at home in the same session.
 
-See [the plan](plan.md#see-and-open-windows-in-one-existing-session) for review and verification.
+5. In a PC shell, run `printf 'first line\n    second line\n'`. Tap that window's name on Android. The selected pane preview shows both lines with the indentation and refreshes while Android is in the foreground. Selecting and reading a pane do not change PC focus or send input.
+
+See [recorded verification](#recorded-verification) for what was checked.
 
 ## Run the standalone binary
 
@@ -44,11 +44,11 @@ server/target/release/glowkin-bridge --bind 192.168.1.10 --port 8787
 # Or bind the PC's Tailscale address; start Tailscale separately.
 server/target/release/glowkin-bridge --bind 100.101.102.103 --port 8787
 
-# IPv6 listeners also work; do not bracket the CLI bind address.
+# IPv6 bind syntax; do not bracket the CLI address.
 server/target/release/glowkin-bridge --bind fd7a:115c:a1e0::1234 --port 8787
 ```
 
-The CLI prints an unauthenticated-access warning before binding.
+The CLI warns before binding that access is unauthenticated and any reachable peer can read eligible pane contents.
 The default port is 8787; valid CLI ports are 1–65535.
 Binding a specific interface is preferable to binding every interface.
 Choose WLAN or Tailscale binding as appropriate; a single interface bind does not promise access through other interfaces.
@@ -63,36 +63,43 @@ curl --fail http://127.0.0.1:8787/v1/connection/snapshot
 ```
 
 Use the chosen bind address instead of loopback when necessary.
-Expect HTTP 200 and `application/json` with `protocolVersion: 1`, an opaque `revision`, and `workspace` state.
+Expect HTTP 200, `Content-Type: application/json`, and `Cache-Control: no-store`.
+The v1 snapshot requires integer `protocolVersion: 1` and a nonempty string `revision` that stays stable until the bridge restarts.
+Android ignores unknown fields and accepts older snapshots without `workspace`, but hides workspace controls.
 `POST /v1/workspace/open-shell` is the only mutation route.
+`POST /v1/workspace/read-pane` is read-only. A fixed-length JSON body supplies `generation`, `sessionId`, `windowId`, and `paneId` from the inventory. Eligible windows advertise `paneId`. Older bridges, split windows, and windows with an effective tmux `after-capture-pane` hook omit it. Large inventories may omit pane IDs to preserve the window list.
+A successful read returns UTF-8 `text/plain` with `Cache-Control: no-store`. Stale or ineligible targets return 409 without content. An over-limit capture fails rather than presenting a partial screen.
 Unknown routes return 404; mutations to the snapshot route return 405.
 There is no remote disconnect route.
 
 ## Android
 
 Target SDK remains 36; minimum SDK remains 28.
-Open Glowkin and enter a hostname or IP address and a separate port.
+Enter a hostname or IP address and a separate port (1–65535).
 Do not enter `http://`, a path, credentials, or a host with an embedded port.
 Raw and bracketed IPv6 are accepted; the saved host omits brackets.
-Choose **Save and connect**, or **Replace and connect** for an existing endpoint.
-Saving persists one endpoint and clears the old server's snapshot.
-Invalid input does not replace the saved endpoint.
-A connection failure does not erase it.
+Validation rejects malformed hosts without resolving DNS.
+**Save and connect** or **Replace and connect** persists one endpoint across restarts and clears the old server's snapshot.
+Invalid input or connection failure does not erase the saved endpoint.
 
 **Retry** reconnects using the saved endpoint without saving draft edits.
 **Disconnect** stops local polling without contacting or stopping the server.
 Foreground polling reads current state every two seconds after the preceding read completes.
-A failed read shows disconnected, retains a visibly stale snapshot if available, and retries while foregrounded.
-Each HTTP connect/read timeout is three seconds; responses are bounded to 64 KiB.
-Redirects and HTTP caching are disabled; requests carry no application credentials.
-Protocol mismatches require checking the port and compatible bridge version.
-The app saves only the endpoint, not a durable snapshot or command queue.
-Returning to the foreground automatically reconciles the saved endpoint unless the user explicitly disconnected during this activity lifetime.
-Backgrounding or destroying the activity stops scheduled polling and discards obsolete UI deliveries.
-An already-running bounded HTTP read may finish; it cannot repopulate the foreground screen after invalidation.
-No Android background service or push integration is installed.
+Android shows connecting, then connected only after a valid snapshot.
+A failed read shows disconnected with an actionable error, marks retained state stale, and retries while foregrounded.
+A non-200 or invalid snapshot is a protocol error: check the port and bridge version.
+Transport errors and timeouts mean unreachable, not that Pi stopped or a command succeeded.
+Each connect/read timeout is three seconds; snapshots are bounded to 64 KiB.
+Requests disable redirects and caching and carry no application credentials.
+The app saves no snapshot or command queue.
+Foreground entry reconciles the saved endpoint unless the user disconnected during this activity lifetime.
+Backgrounding or destroying the activity stops scheduled reads and invalidates in-flight UI deliveries.
+There is no background service or push integration.
+Pane previews show the current single-pane screen, not scrollback or an interactive terminal. They are bounded to 64 KiB and are not logged or saved by Android or the bridge.
+After displaying a nonblank preview, Android hides the app’s contents in Recents and blocks screen capture until the activity closes.
+See [delivery rules](decisions.md#connection-and-delivery) for uncertain mutations.
 
-## Automated verification
+## Development and automated checks
 
 ```sh
 cargo test --locked --manifest-path server/Cargo.toml
@@ -107,16 +114,6 @@ JVM tests cover domain validation, persistence orchestration, stale snapshots, r
 Instrumentation tests use real SharedPreferences and local HTTP sockets.
 An emulator can check local transport and UI behavior but cannot establish WLAN/Tailscale acceptance.
 
-Recorded verification for the original connection slice (before the Rust port):
-- All three original server tests passed; CLI live HTTP and security-warning smoke checks passed.
-- Android: 12 connection-domain tests plus the existing example passed; debug assembly and lint passed.
-- Emulator `emulator-5554`: six instrumentation tests passed, including the real MainActivity save/connect, stale disconnect, and recreation/reconciliation flow.
-- Lint retains starter/dependency-version warnings, including the intentionally preserved target SDK 36; no lint errors occurred.
-
-Before implementation, compile SDK 36.1 failed dependency metadata checks.
-After correcting compile SDK to 37, the preimplementation JVM run reached Kotlin but failed on missing production APIs.
-Those were setup/missing-foundation failures, not behavioral assertion failures.
-
 For a loopback bridge and emulator, this optional development mapping makes the PC bridge available at Android `127.0.0.1:8787`:
 
 ```sh
@@ -125,16 +122,23 @@ adb -s emulator-5554 reverse tcp:8787 tcp:8787
 adb -s emulator-5554 reverse --remove tcp:8787
 ```
 
-## Original connection manual acceptance checklist
+## Manual acceptance checks
 
 1. On a physical Android device and PC on the intended trusted WLAN, bind the PC's WLAN address and permit only the intended peer through host controls.
 2. Enter that address/port in Android and verify connecting then connected, without login or pairing.
 3. Replace the endpoint, force-stop/reopen Android, and verify the replacement remains saved and is reread.
 4. Stop the bridge or interrupt the device network; verify disconnected, actionable error, and a stale previous snapshot.
 5. Restart the bridge or restore the network; verify automatic foreground reconciliation to the new process revision, without implying any command succeeded.
-6. Background Android; confirm PC access logs stop after any in-flight read completes. Foreground it and confirm polling resumes.
+6. Observe bridge HTTP traffic. Background Android and confirm no new polls after any in-flight read completes. Foreground it and confirm polling resumes.
 7. Repeat connection and network-loss checks over actual Tailscale with the PC's tailnet hostname/address and restrictive tailnet policy. Do not count `adb reverse` as WLAN or Tailscale.
 8. With a real pi running in tmux independently, record its PID and session/window identity. Disconnect, background, and force-stop Android; verify the same pi process remains usable from the PC. Stop/restart the bridge and verify again. This checks lifetime independence only, not integration with pi.
 9. Verify real IPv6 reachability where supported; parsing and URI construction alone do not prove network routing.
+10. In one tmux session, verify Android lists and refreshes PC-created windows. Tap **Open shell** and verify exactly one interactive shell at home in that session, not an Android terminal. An unavailable target must fail without opening a window elsewhere.
 
-The user reported that the manual checks work and requested marking the slice Done after clarification of the acceptance checklist. This records user acceptance, not independently observed device results. Real IPv6 routing remains unverified.
+## Recorded verification
+
+- **Connection, automated (original slice, before Rust port):** Three server tests and live HTTP/security-warning CLI smoke checks passed. Android passed 12 domain tests plus the existing JVM example, six emulator tests (including MainActivity save/connect, stale disconnect, and recreation), debug assembly, and lint. Lint reported starter/dependency warnings, not errors.
+- **Connection, user acceptance:** The user reported the manual checks worked and requested completion. These are not independently observed device results. Real IPv6 routing remains unverified.
+- **Single-session workspace, automated:** Seven bridge, 13 Android JVM, and seven emulator tests passed. Rust formatting, Clippy, both debug builds, and Android lint passed. The emulator refreshed PC-created windows through the real bridge and opened exactly one interactive shell at home in the same disposable session. Private-socket tests rejected unavailable and stale targets without retargeting. A later `cargo test --locked --manifest-path server/Cargo.toml --test workspace_http` rerun on tmux 3.8 passed all three tests without app changes.
+- **Single-session workspace, user confirmation:** **Open shell** creates a window on the PC; the user had expected an Android terminal. This confirms window creation, not the working directory or the other guarantees.
+- **Pane preview:** The emulator connected to the real release bridge over `adb reverse` and previewed a shell and an offline Pi TUI on disposable tmux 3.8. It preserved indentation, PC focus, and pending input. See the [slice verification](plan.md#read-a-selected-pc-tmux-pane-on-android) for rejection, compatibility, privacy, and coverage details. No physical-device or WLAN/Tailscale verification was performed for pane reading.

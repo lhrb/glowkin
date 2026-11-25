@@ -1,42 +1,32 @@
-# Decisions and assumptions
+# Durable decisions and constraints
 
-## Accepted product decisions
-- Connect using a saved address and port over WLAN or Tailscale, without authentication. The requester accepts that any reachable peer can read conversations, instruct agents, and close windows. WLAN does not itself protect this authority; Tailscale policy and host/network controls remain deployment responsibilities. Public exposure is unsupported.
-- Discover PC-created work across all sessions on the configured tmux server; do not limit discovery to app-created agents.
-- Allow confirmed closure of the last window, even if that ends the final tmux session. Preserve remote recovery instead: the running bridge can create a fresh session with a shell from Android when no tmux server is running or no sessions remain. Do not create a replacement automatically or require PC interaction.
-- Confirm other closures because they terminate every process in the window.
-- Combine tmux windows and agent attention in one primary overview.
-- Browse directories only; retain normal pi terminal use alongside Android.
+## Connection and delivery
 
-## Integration finding and scope
-A globally installed interactive pi extension can expose conversation events, history, prompt submission, stop, and lifecycle without replacing the TUI. Existing processes require a one-time reload after installation. The extension must reconnect independently when the server appears.
+- [Trusted-network HTTP](connection-deployment.md#scope-and-security) uses a saved address and port, not application authentication. Keep the default bind loopback-only. Reachability grants shipped capabilities, not approval for future controls.
+- Use foreground snapshot polling for authoritative current state. The opaque revision identifies the bridge lifetime, not an ordered revision or tmux/agent state. A valid read replaces the prior snapshot regardless of revision ordering. Extend the snapshot for inventory rather than inferring availability from connection status.
+- Send a mutation once per explicit action and only when connected and reconciled. Treat ambiguous delivery as uncertain, not applied. Block further mutations until an authoritative read **begun after** the uncertainty succeeds. A failed or older read cannot unlock the gate. Never retain or replay the request; only a fresh action against the reconciled target can retry.
+- The v1 snapshot's workspace field is optional for compatibility. Older bridges still connect without offering workspace controls. Preserve this contract when extending it.
 
-The installed pi API reports blocking UI prompt spans but exposes no generic response resolver in interactive mode. Structured dialog responses exist in RPC mode, which is not an attachment interface for an existing TUI. Therefore v1 detects these prompts and directs the user to the PC; it does not promise remote permission approval. Pi's built-in tool execution is not a new Glowkin approval workflow. Supporting remotely answerable dialogs later requires cooperating prompt owners or a pi API change.
+## Workspace targeting
 
-Research: installed pi `docs/extensions.md`, `docs/rpc.md`, `docs/rpc-extension-ui.md`, and extension types. Revalidate against the targeted pi version during implementation.
+- Use one configured tmux server under the bridge OS account, not other users or sockets. Resolve the account's default socket (including `TMUX_TMPDIR`), not the socket inherited via `TMUX`. Keep tmux commands in the bridge adapter; use `-N` for current operations so they never start a server.
+- Keep bridge and tmux lifetimes distinct. Use stable tmux IDs, not names or mutable indices. Keep session, window, and pane identities distinct; check membership and fail without retargeting. Treat labels and paths as data, not commands.
+- Read session count and inventory in one tmux queue. For **Open shell**, check the exact session ID, tmux PID/start time, and single-session count in the same queue as creation via `if-shell -F`. This avoids configuration writes. The generation is not authentication and assumes no PID reuse within the same tmux start-time second.
+- Launch the configured interactive shell in a detached new window, bypassing `default-command`. Pass the bridge account's HOME literally; refuse to start elsewhere. HTTP 204 acknowledges window creation, not shell readiness. Shell startup files and tmux hooks still run.
+- Keep mutation requests bounded and fixed-length. Reject browser origins and send no CORS headers. Bound tmux concurrency, time, and output. Android uses fixed-length streaming and disables redirects to avoid automatic mutation replay.
 
-## Planning defaults
-- Build for the requester's everyday workflow first: one existing tmux session, with new windows opened like `Ctrl+b c`. Keep and extend the implementation. The accepted product decisions above describe the broader target, not the first slice.
-- One PC, one configured tmux server under its OS account; other users and sockets are outside discovery.
-- Without configured project-root policy, directory browsing follows the server account's access rights. No file mutation UI is introduced.
-- Start pi in a new window to avoid injecting launch commands into an unknown active shell or agent.
-- Android submissions during a run become follow-ups; explicit stop remains separate.
-- Current conversation branch and current state are authoritative after reconnect; exact replay of every missed transient event is unnecessary.
-- No additional durable chat archive or Android offline chat cache is required; existing pi session storage remains authoritative.
-- Builder chooses transport, server language, rendering, reconnect timing, and routine UX. Document significant tradeoffs here.
+## Pane previews
 
-## Connection implementation decisions
-- Choose foreground read-only HTTP polling instead of a persistent channel. Reconnect reconciles snapshots; it never replays commands. Only a read begun after uncertain delivery can authorize a fresh explicit retry.
-- The bridge revision identifies a bridge lifetime, not workspace or agent state.
-- Use trusted-network cleartext HTTP with a loopback-only default bind. Non-loopback deployment requires explicit network access controls; public exposure is unsupported.
-- Background/destruction stops polling and invalidates obsolete responses, without touching server or agent lifetimes. Foreground entry reconnects unless explicitly disconnected during that activity lifetime.
+- Advertise the optional pane ID only for eligible single-pane windows. Omit pane IDs rather than losing a previously listable inventory at either existing size limit. Keep contents out of inventory and use a separate read-only, fixed-length JSON POST with the existing browser-request checks. The method is not an authorization mechanism.
+- Check the full target and capture in one synchronous tmux queue. Refuse panes with an effective `after-capture-pane` hook rather than running local side effects or changing the user's tmux configuration. Return only the visible grid as plain text with `no-store`. Refuse an oversized capture rather than showing a partial screen.
+- Clear the preview across selection, lifecycle, or invalidation boundaries. Treat each tap as a distinct selection, even when the user returns to the same pane. Keep preview text in memory only. Secure the Android window before displaying pane text because the Recents-only API still showed preview pixels on the emulator. This also blocks screenshots and screen recording until the activity closes.
 
-Deployment and connection verification: [connection-deployment.md](connection-deployment.md).
+## Constraints for optional work
 
-## Single-session workspace implementation decisions
-- Extend the v1 snapshot with optional workspace state. Older bridges still connect but offer no workspace controls. The bridge revision still identifies the bridge process; the workspace generation identifies the tmux lifetime independently.
-- Use the bridge account's tmux default socket, including `TMUX_TMPDIR`, not the socket inherited in `TMUX`. Every invocation uses `-N` to prohibit server starts. Verified with tmux 3.8.
-- Read session count and inventory in one tmux queue. Opening uses `if-shell -F` to compare the exact session ID, tmux PID/start time, and session count immediately before `new-window` in that same queue. This needs no tmux configuration write. The discriminator is not authentication; it assumes the OS does not reuse the same PID within the same tmux start-time second.
-- Launch the configured tmux shell interactively in a new detached window, bypassing `default-command`. A fixed launcher takes the bridge account's HOME as a literal argument and refuses to start the shell anywhere else. A 204 acknowledges window creation, not completion of shell startup. User shell startup files and tmux hooks still run as configured.
-- Accept only bounded, fixed-length JSON with the session ID and generation on the mutation route. Reject browser-origin requests and send no CORS headers. Keep the existing listener and trust model. Cap tmux subprocess concurrency, elapsed time, and output; report unexpected mutation failures as uncertain.
-- Android sends an explicit action once with fixed-length streaming and redirects disabled. It refreshes afterward, retains the outcome message, and disables further mutation until an authoritative read after uncertainty. A fresh tap uses the visible reconciled target, never the earlier request.
+These constraints apply if a direction is approved, not as authority for the current workflow.
+
+- **Workspace:** Discover existing PC work, not just app-created windows. Android selection must not change PC focus. Destructive close requires explicit confirmation that every process in the window will terminate, even for the final window. Verify stale and linked targets and final-window behavior before shipping close. Recovery from no server or no sessions must be explicit, never automatic. It must work without PC interaction or a bridge restart and report actual shell startup failure. No direct session deletion or pane-layout management.
+- **Directories and launch:** Browse directories, including parents, under the bridge account's access rights unless a project-root policy is configured. Do not add file viewing or mutation. Verify literal directory entry before claiming success. A plain shell may fall back to home with a pane warning; Pi must not start there if entry fails. Start Pi in a fresh window rather than injecting a launch command into an existing pane. See [tmux probe findings](tmux-findings.md).
+- **Structured Pi chat:** Preserve independent interactive Pi use and unsent PC editor contents. An installed extension can attach to a normal TUI after a one-time reload and must reconnect independently, including late bridge startup. Do not replace the TUI with RPC. Keep agent and session/window/pane identities distinct; lost connectivity or agent exit disables remote submission rather than choosing a replacement. Inputs share the same conversation without duplicates. Prompts during work queue as follow-ups; stop is separate and delivery does not prove cancellation. Reconcile the current branch and state on reload, reconnect, or session change; do not replay commands or merge unrelated agents. Pi session storage stays authoritative; no extra durable archive or offline cache.
+- **Attention:** State is per agent, including multiple agents in one window. Distinguish idle, working, needs input, done, failed, and unavailable/unknown where observable. A turn ending is not completion while follow-ups, retries, or compaction remain. Newly observed idle is not completion. New work supersedes the previous result; prompt resolution clears attention. Reconcile after reconnect and show unobserved state as stale/unknown. No background notifications or inventory of unbridged internal subagents.
+- **Pi dialogs:** Installed interactive extension APIs exposed blocking prompt spans but no generic response resolver. Mark detectable blockers as needing input on the PC. RPC dialog responses cannot attach to an existing TUI. Do not promise generic remote approval or turn Pi tool execution into a Glowkin approval workflow. Revalidate against the targeted Pi version (`docs/extensions.md`, `docs/rpc.md`, `docs/rpc-extension-ui.md`, extension types); remote answers would need cooperating prompt owners or an API change.
