@@ -1,11 +1,10 @@
 # Connection test contract and builder handoff
 
-Tests only; no production implementation is supplied.
 This contract covers `connection.md`, not workspace discovery, chat, or command UI.
 
 ## Minimal design
 
-Use Python's standard-library HTTP server and `unittest`; add no server dependencies.
+Run the bridge independently of Android, Pi, and tmux.
 Use a framework-free Kotlin connection domain with synchronous endpoint-store and snapshot-transport ports.
 The caller runs blocking operations off Android's main thread and schedules `poll()` while connected.
 The domain does not own a thread, retry timer, Android lifecycle, or an agent process.
@@ -116,33 +115,25 @@ The app needs Internet permission and cleartext HTTP enabled for the accepted tr
 No new test library is required.
 IPv6 validation has JVM coverage; real IPv6 HTTP reachability still needs device/network verification.
 
-## Python API
+## Bridge HTTP contract
 
-From `server/`, import:
-
-```python
-from features.connection.adapters.inbound.http.bridge import create_server
-server = create_server(host="127.0.0.1", port=0)
-```
-
-Return a bound, not-yet-serving standard-library HTTP server supporting `server_address`, `serve_forever()`, `shutdown()`, and `server_close()`.
-Port zero requests an ephemeral port for tests.
-Production binding/CLI configuration remains the builder's choice.
-The anonymous snapshot endpoint returns `application/json` with the versioned payload above.
+Tests launch the Rust bridge binary with its default loopback bind and an explicit port.
+The anonymous snapshot endpoint returns `application/json` with the versioned payload above and `Cache-Control: no-store`.
+The revision stays stable until the bridge restarts.
 Unknown paths return 404.
-POST to the snapshot route returns 405.
+POST, PUT, PATCH, and DELETE to the snapshot route return 405.
 There is no remote disconnect route or process ownership in this foundation.
 
-The process test uses an independent Python sentinel across client disconnect and bridge shutdown.
+The process test uses an independent sentinel across client disconnect and bridge shutdown.
 It does **not** attach to pi or tmux and cannot establish real agent survival.
 Do not label it an agent-survival acceptance test.
 
 ## Verification and known gaps
 
-Run server tests from the repository root with the source root on Python's path:
+Run server tests from the repository root:
 
 ```sh
-PYTHONPATH=server python3 -m unittest discover -s server/tests -v
+cargo test --locked --manifest-path server/Cargo.toml
 ```
 Run Android JVM tests:
 
@@ -158,13 +149,14 @@ cd android
 ./gradlew :app:connectedDebugAndroidTest --console=plain
 ```
 
-The pre-test Gradle baseline fails `:app:checkDebugAarMetadata`: Core 1.19.1 and lifecycle 2.11.0 require compileSdk 37; the starter uses 36.1.
+### Original handoff notes
+
+The Gradle baseline failed `:app:checkDebugAarMetadata`: Core 1.19.1 and lifecycle 2.11.0 require compileSdk 37; the starter uses 36.1.
 Java 21 is installed; this is not a JVM setup failure.
 The builder will align compileSdk only, leaving target/min SDK unchanged.
 No build files were changed by the test author.
 Production APIs are absent, so import/compilation failures are expected until implementation exists.
 An emulator (`emulator-5554`) became available at handoff; adapter execution remains blocked by missing production APIs.
-The server command failed as expected with `ModuleNotFoundError: No module named 'features'`.
 To distinguish missing implementation from the baseline SDK mismatch, this diagnostic command bypassed only AAR metadata validation:
 
 ```sh

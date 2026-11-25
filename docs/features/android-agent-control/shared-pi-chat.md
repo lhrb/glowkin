@@ -9,7 +9,7 @@ Start pi in a selected project or join an existing interactive pi agent, then ch
 - A one-time installed pi bridge extension integrates normal interactive pi; it does not replace the terminal with RPC mode.
 - Already-running pi processes become available after a one-time extension reload; agents with the extension loaded register even if the server starts later.
 - Starting pi from a selected directory creates a new window in the selected tmux session without injecting commands into an existing terminal process.
-- A failed launch reports failure and does not claim an agent is ready.
+- Unlike **Open shell**, **Start pi** must not fall back to home when a selected directory cannot be entered. Do not start pi in that case. A failed launch reports failure and does not claim an agent is ready.
 - Identify each live agent separately and associate it with its tmux session, window, and pane; multiple agents in a window remain separately selectable.
 - Opening an agent shows the current conversation branch, including user messages, assistant responses, and tool activity; historical branches are not mixed into the chat.
 - PC and Android input affect the same pi session; messages from both sources appear in that shared conversation without duplicated submissions.

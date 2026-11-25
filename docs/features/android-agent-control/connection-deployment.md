@@ -20,21 +20,23 @@ Do not change global firewall policy merely to make this example work.
 
 ## Run the server
 
-Use Python 3 with its standard library; no packages need installing.
+Build with Rust and Cargo. Run the standalone binary without Python or Pi.
 From the repository root:
 
 ```sh
+cargo build --release --locked --manifest-path server/Cargo.toml
+
 # Safe default: loopback only, useful with adb forwarding.
-python3 server/bridge.py
+server/target/release/glowkin-bridge
 
 # Substitute the PC's actual trusted WLAN interface address.
-python3 server/bridge.py --bind 192.168.1.10 --port 8787
+server/target/release/glowkin-bridge --bind 192.168.1.10 --port 8787
 
 # Or bind the PC's Tailscale address; start Tailscale separately.
-python3 server/bridge.py --bind 100.101.102.103 --port 8787
+server/target/release/glowkin-bridge --bind 100.101.102.103 --port 8787
 
 # IPv6 listeners also work; do not bracket the CLI bind address.
-python3 server/bridge.py --bind fd7a:115c:a1e0::1234 --port 8787
+server/target/release/glowkin-bridge --bind fd7a:115c:a1e0::1234 --port 8787
 ```
 
 The CLI prints an unauthenticated-access warning before binding.
@@ -90,20 +92,20 @@ No Android background service or push integration is installed.
 ## Automated verification
 
 ```sh
-PYTHONPATH=server python3 -m unittest discover -s server/tests -v
+cargo test --locked --manifest-path server/Cargo.toml
 cd android
 ./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 ./gradlew :app:connectedDebugAndroidTest
 ```
 
-Server tests check anonymous HTTP snapshots, route rejection, and independent-process survival.
-The independent Python sentinel is **not** a pi/tmux survival test.
+Server tests exercise the Rust binary: anonymous HTTP snapshots, revision stability and change on restart, route rejection, CLI validation, and independent-process survival through shutdown.
+The independent sentinel is **not** a pi/tmux survival test.
 JVM tests cover domain validation, persistence orchestration, stale snapshots, reconciliation, and obsolete responses.
 Instrumentation tests use real SharedPreferences and local HTTP sockets.
 An emulator can check local transport and UI behavior but cannot establish WLAN/Tailscale acceptance.
 
-Recorded implementation verification:
-- Python: all three server tests passed; CLI live HTTP and security-warning smoke checks passed.
+Recorded verification for the original connection slice (before the Rust port):
+- All three original server tests passed; CLI live HTTP and security-warning smoke checks passed.
 - Android: 12 connection-domain tests plus the existing example passed; debug assembly and lint passed.
 - Emulator `emulator-5554`: six instrumentation tests passed, including the real MainActivity save/connect, stale disconnect, and recreation/reconciliation flow.
 - Lint retains starter/dependency-version warnings, including the intentionally preserved target SDK 36; no lint errors occurred.
