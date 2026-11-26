@@ -23,6 +23,7 @@ const SNAPSHOT_PATH: &str = "/v1/connection/snapshot";
 const OPEN_PATH: &str = "/v1/workspace/open-shell";
 const READ_PATH: &str = "/v1/workspace/read-pane";
 const SEND_INPUT_PATH: &str = "/v1/workspace/send-input";
+const SNAPSHOT_BODY_LIMIT: usize = 65536;
 const TARGET_BODY_LIMIT: usize = 256;
 const INPUT_BODY_LIMIT: usize = 2048;
 
@@ -106,13 +107,19 @@ async fn respond(
         "workspace": workspace_json(&workspace, true),
     });
     let mut encoded = body.to_string();
-    if encoded.len() > 65536 {
+    if encoded.len() > SNAPSHOT_BODY_LIMIT {
         body["workspace"] = workspace_json(&workspace, false);
         encoded = body.to_string();
-        if encoded.len() > 65536 {
+        if encoded.len() > SNAPSHOT_BODY_LIMIT {
             body["workspace"] = workspace_json(&Workspace::Unavailable, false);
             encoded = body.to_string();
         }
+    }
+    // Fit the advertisement only after choosing the same inventory older clients received.
+    body["paneInputEnabled"] = json!(enable_pane_input);
+    let advertised = body.to_string();
+    if advertised.len() <= SNAPSHOT_BODY_LIMIT {
+        encoded = advertised;
     }
     let mut response = Response::new(Full::new(Bytes::from(encoded)));
     response.headers_mut().insert(

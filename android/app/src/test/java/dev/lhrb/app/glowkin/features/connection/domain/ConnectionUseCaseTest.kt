@@ -4,6 +4,9 @@ import dev.lhrb.app.glowkin.features.connection.domain.ports.EndpointStorePort
 import dev.lhrb.app.glowkin.features.connection.domain.ports.SnapshotTransportPort
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 class ConnectionUseCaseTest {
     @Test fun `accepts DNS WLAN Tailscale IPv4 and IPv6 with boundary ports`() {
@@ -242,6 +245,46 @@ class ConnectionUseCaseTest {
         connection.poll()
         assertFalse(connection.state.needsReconciliation)
         assertEquals("reconciliation must not replay the uncertain change", 1, sends)
+    }
+
+    @Test fun `literal input is one valid UTF-8 line and capped in bytes`() {
+        for (valid in listOf(" ", "π".repeat(128), "😀".repeat(64), "a".repeat(256))) {
+            assertTrue(PaneInput.Text.isValid(valid))
+        }
+        for (invalid in listOf("", "a".repeat(257), "π".repeat(129), "\n", "\u007f", "\u0085", "\u2028", "\u2029", "\ud800")) {
+            assertFalse(PaneInput.Text.isValid(invalid))
+        }
+    }
+
+    @Test fun `held older read and failed newer read cannot reconcile uncertain delivery`() {
+        val transport = FakeTransport()
+        val connection = ConnectionUseCase(MemoryStore(Endpoint.parse("pc", 8787)), transport)
+        connection.connect()
+        val started = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        transport.fetch = {
+            started.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            Snapshot("started-before-uncertainty")
+        }
+        val oldRead = thread { connection.poll() }
+        try {
+            assertTrue(started.await(5, TimeUnit.SECONDS))
+            assertEquals(ChangeOutcome.UNCERTAIN, connection.attemptChange { ChangeOutcome.UNCERTAIN })
+        } finally {
+            release.countDown()
+            oldRead.join(5000)
+        }
+        assertFalse(oldRead.isAlive)
+        assertEquals(Snapshot("initial"), connection.state.snapshot)
+        assertTrue(connection.state.needsReconciliation)
+        transport.fetch = { throw ConnectionFailure(ConnectionError.UNREACHABLE) }
+        connection.poll()
+        assertEquals(ChangeOutcome.RECONCILIATION_REQUIRED, connection.attemptChange { error("must not send") })
+        transport.fetch = { Snapshot("started-after-uncertainty") }
+        connection.poll()
+        assertFalse(connection.state.needsReconciliation)
+        assertEquals(Snapshot("started-after-uncertainty"), connection.state.snapshot)
     }
 
     private fun assertInvalid(block: () -> Unit) {

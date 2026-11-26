@@ -6,7 +6,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -17,10 +16,11 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModelProvider
 import dev.lhrb.app.glowkin.features.connection.ConnectionModule
+import dev.lhrb.app.glowkin.features.connection.ConnectionViewModel
 import dev.lhrb.app.glowkin.features.connection.PanePreview
 import dev.lhrb.app.glowkin.features.connection.domain.*
 import dev.lhrb.app.glowkin.ui.theme.GlowkinTheme
@@ -29,8 +29,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var connection: ConnectionModule
     private var state by mutableStateOf(ConnectionState())
     private var storageError by mutableStateOf<String?>(null)
-    private var openingShell by mutableStateOf(false)
+    private var mutating by mutableStateOf(false)
     private var preview by mutableStateOf(PanePreview())
+    private var paneDraft by mutableStateOf("")
     private var previewProtected = false
     private var paneName by mutableStateOf<String?>(null)
     private var recovering by mutableStateOf(true)
@@ -41,27 +42,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         connectionRequested = savedInstanceState?.getBoolean("connectionRequested") == true
-        connection = ConnectionModule(applicationContext) { current, error, opening, pane ->
-            if (pane.text?.isNotBlank() == true && !previewProtected) {
-                // Keep protection until destruction so a frame with old pixels cannot be saved.
-                window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-                previewProtected = true
-            }
-            state = current
-            storageError = error
-            openingShell = opening
-            preview = pane
-            when {
-                current.status == ConnectionStatus.CONNECTED -> {
-                    recovering = false
-                    if (reconnectRequested) closeConnectionPage()
-                }
-                current.error != null -> {
-                    recovering = true
-                    if (paneName != null) leaveDetail()
-                }
-            }
-        }
+        connection = ViewModelProvider(this)[ConnectionViewModel::class.java].connection
+        connection.attachActivity()
         setContent {
             GlowkinTheme {
                 // Keep overview position while its composition is replaced by another page.
@@ -92,7 +74,7 @@ class MainActivity : ComponentActivity() {
                     val modifier = Modifier.padding(padding).consumeWindowInsets(padding)
                     when {
                         showConnection -> ConnectionScreen(
-                            state, storageError, openingShell,
+                            state, storageError, mutating,
                             onReplace = { host, port ->
                                 connection.replace(host, port)
                                 reconnectRequested = true
@@ -108,9 +90,28 @@ class MainActivity : ComponentActivity() {
                             },
                             modifier = modifier,
                         )
-                        selectedName != null -> PaneDetail(selectedName, preview, modifier)
+                        selectedName != null -> {
+                            val shown = state
+                            val pane = preview
+                            PaneDetail(
+                                selectedName, shown, pane, paneDraft, mutating,
+                                onDraft = { draft ->
+                                    if (pane.selection === preview.selection && preview.offersInput(state) && !mutating) {
+                                        paneDraft = draft
+                                    }
+                                },
+                                onInput = { input ->
+                                    val chosen = pane.selection
+                                    val currentDraft = input !is PaneInput.Text || input.value == paneDraft
+                                    val accepted = chosen != null && currentDraft && connection.sendInput(shown, chosen, input)
+                                    if (accepted && input is PaneInput.Text) paneDraft = ""
+                                    accepted
+                                },
+                                modifier = modifier,
+                            )
+                        }
                         else -> SessionOverview(
-                            state, openingShell, listState,
+                            state, mutating, storageError, listState,
                             onRefresh = connection::retry,
                             onOpenShell = { connection.openShell(state) },
                             onSelectPane = { window, target ->
@@ -124,6 +125,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun renderConnection(current: ConnectionState, error: String?, busy: Boolean, pane: PanePreview) {
+        val offersInput = pane.offersInput(current)
+        if ((offersInput || pane.text?.isNotBlank() == true) && !previewProtected) {
+            // Protect drafts and previews before composition, even before the first pane read.
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            previewProtected = true
+        }
+        if (!offersInput || pane.selection !== preview.selection) paneDraft = ""
+        state = current
+        storageError = error
+        mutating = busy
+        preview = pane
+        when {
+            current.status == ConnectionStatus.CONNECTED -> {
+                recovering = false
+                if (reconnectRequested) closeConnectionPage()
+            }
+            current.error != null -> {
+                recovering = true
+                if (paneName != null) leaveDetail()
+            }
+        }
+    }
+
     private fun closeConnectionPage() {
         connectionRequested = false
         reconnectRequested = false
@@ -132,6 +157,7 @@ class MainActivity : ComponentActivity() {
     private fun leaveDetail() {
         connection.clearPane()
         preview = PanePreview()
+        paneDraft = ""
         paneName = null
     }
 
@@ -140,9 +166,8 @@ class MainActivity : ComponentActivity() {
         outState.putBoolean("connectionRequested", connectionRequested)
     }
 
-    override fun onStart() { super.onStart(); connection.start() }
+    override fun onStart() { super.onStart(); connection.start(::renderConnection) }
     override fun onStop() { connection.stop(); super.onStop() }
-    override fun onDestroy() { connection.close(); super.onDestroy() }
 }
 
 @Composable
@@ -192,7 +217,7 @@ private fun WorkspaceBar(
 private fun ConnectionScreen(
     state: ConnectionState,
     storageError: String?,
-    openingShell: Boolean,
+    mutating: Boolean,
     onReplace: (String, Int) -> Unit,
     onRetry: () -> Unit,
     onDisconnect: () -> Unit,
@@ -213,9 +238,7 @@ private fun ConnectionScreen(
             null -> null
         }
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        if (state.changeOutcome == ChangeOutcome.UNCERTAIN) {
-            Text("Open shell may have succeeded. Check the PC windows before trying again.")
-        }
+        state.uncertainMessage?.let { Text(it) }
         OutlinedTextField(host, { host = it; inputError = null }, label = { Text("Hostname or IP address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(port, { port = it; inputError = null }, label = { Text("Port") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
         Button(onClick = {
@@ -225,7 +248,7 @@ private fun ConnectionScreen(
             } catch (failure: InvalidEndpoint) { inputError = failure.message }
         }) { Text(if (state.endpoint == null) "Save and connect" else "Replace and connect") }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = onRetry, enabled = state.endpoint != null && !openingShell) { Text("Retry") }
+            OutlinedButton(onClick = onRetry, enabled = state.endpoint != null && !mutating) { Text("Retry") }
             OutlinedButton(onClick = onDisconnect, enabled = state.endpoint != null) { Text("Disconnect") }
         }
         state.snapshot?.let {
@@ -237,19 +260,8 @@ private fun ConnectionScreen(
     }
 }
 
-@Composable
-private fun PaneDetail(name: String, preview: PanePreview, modifier: Modifier) {
-    Column(modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(name, style = MaterialTheme.typography.headlineMedium)
-        Text("Read-only pane", style = MaterialTheme.typography.titleSmall)
-        val text = preview.text
-        when {
-            preview.error != null -> Text(preview.error)
-            text == null -> Text("Reading pane…")
-            text.isBlank() -> Text("Pane is blank.")
-            else -> Text(text, fontFamily = FontFamily.Monospace, softWrap = false,
-                modifier = Modifier.fillMaxWidth().weight(1f)
-                    .verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()))
-        }
+internal val ConnectionState.uncertainMessage: String?
+    get() = if (changeOutcome != ChangeOutcome.UNCERTAIN) null else when (changeKind) {
+        ChangeKind.OPEN_SHELL -> "Open shell may have succeeded. Check the PC windows before trying again."
+        ChangeKind.PANE_INPUT -> "Input may have been injected. Check the pane before trying again."
     }
-}

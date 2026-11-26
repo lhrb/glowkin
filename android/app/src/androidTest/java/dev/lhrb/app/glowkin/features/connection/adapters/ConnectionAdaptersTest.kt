@@ -44,6 +44,17 @@ class ConnectionAdaptersTest {
         }
     }
 
+    @Test fun onlyBooleanTrueAdvertisesInput() {
+        val responses = listOf("", ",\"paneInputEnabled\":false", ",\"paneInputEnabled\":true")
+            .map { 200 to """{"protocolVersion":1,"revision":"r"$it}""" }
+        serve(responses) { endpoint ->
+            val transport = HttpSnapshotTransport(timeoutMillis = 1000)
+            assertFalse(transport.fetch(endpoint).paneInputEnabled)
+            assertFalse(transport.fetch(endpoint).paneInputEnabled)
+            assertTrue(transport.fetch(endpoint).paneInputEnabled)
+        }
+    }
+
     @Test fun invalidOrIncompatibleSnapshotsNeverCountAsConnected() {
         for ((status, body) in listOf(
             200 to "not json",
@@ -54,6 +65,10 @@ class ConnectionAdaptersTest {
             200 to """{"protocolVersion":1,"revision":""}""",
             200 to """{"protocolVersion":1,"revision":17}""",
             200 to """{"protocolVersion":1,"revision":null}""",
+            200 to """{"protocolVersion":1,"revision":"r","paneInputEnabled":"true"}""",
+            200 to """{"protocolVersion":1,"revision":"r","paneInputEnabled":1}""",
+            200 to """{"protocolVersion":1,"revision":"r","paneInputEnabled":null}""",
+            200 to """{"protocolVersion":1,"revision":"r","paneInputEnabled":false,"paneInputEnabled":true}""",
             404 to """{"protocolVersion":1,"revision":"r"}"""
         )) {
             serve(listOf(status to body)) { endpoint ->

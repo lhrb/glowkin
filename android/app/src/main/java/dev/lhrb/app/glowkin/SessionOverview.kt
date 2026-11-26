@@ -28,7 +28,8 @@ import dev.lhrb.app.glowkin.features.connection.domain.WorkspaceWindow
 @Composable
 internal fun SessionOverview(
     state: ConnectionState,
-    openingShell: Boolean,
+    mutating: Boolean,
+    actionError: String?,
     listState: LazyListState,
     onRefresh: () -> Unit,
     onOpenShell: () -> Unit,
@@ -51,21 +52,21 @@ internal fun SessionOverview(
                     if (state.stale) Text("Stale snapshot — not current PC state")
                     if (workspace != null) {
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            OutlinedButton(onClick = onRefresh, enabled = !openingShell) { Text("Refresh") }
+                            OutlinedButton(onClick = onRefresh, enabled = !mutating) { Text("Refresh") }
                             if (workspace is Workspace.Ready) {
-                                Button(onClick = onOpenShell, enabled = !openingShell && state.shellTarget != null) {
+                                Button(onClick = onOpenShell, enabled = !mutating && state.shellTarget != null) {
                                     Text("Open shell")
                                 }
                             }
                         }
                     }
-                    val feedback = when (state.changeOutcome) {
+                    val feedback = state.uncertainMessage ?: when (state.changeOutcome) {
                         ChangeOutcome.APPLIED -> "Shell window opened."
                         ChangeOutcome.TARGET_UNAVAILABLE -> "Could not open a shell: the listed tmux session is no longer available."
                         ChangeOutcome.REJECTED -> "The bridge rejected Open shell. Check the bridge version and settings."
-                        ChangeOutcome.UNCERTAIN -> "Open shell may have succeeded. Check the PC windows before trying again."
                         else -> null
                     }
+                    actionError?.let { Text(it) }
                     feedback?.let { Text(it) }
                     when (workspace) {
                         is Workspace.Ready -> if (workspace.windows.isEmpty()) Text("No windows reported for this session.")

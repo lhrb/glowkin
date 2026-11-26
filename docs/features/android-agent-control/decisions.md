@@ -11,20 +11,24 @@
 
 - Use one configured tmux server under the bridge OS account, not other users or sockets. Resolve the account's default socket (including `TMUX_TMPDIR`), not the socket inherited via `TMUX`. Keep tmux commands in the bridge adapter; use `-N` for current operations so they never start a server.
 - Keep bridge and tmux lifetimes distinct. Use stable tmux IDs, not names or mutable indices. Keep session, window, and pane identities distinct; check membership and fail without retargeting. Treat labels and paths as data, not commands.
-- Read session count and inventory in one tmux queue. For **Open shell**, check the exact session ID, tmux PID/start time, and single-session count in the same queue as creation via `if-shell -F`. This avoids configuration writes. The generation is not authentication and assumes no PID reuse within the same tmux start-time second.
-- Launch the configured interactive shell in a detached new window, bypassing `default-command`. Pass the bridge account's HOME literally; refuse to start elsewhere. HTTP 204 acknowledges window creation, not shell readiness. Shell startup files and tmux hooks still run.
+- Read session count and inventory in one tmux queue. Check the single-session count, exact session ID, and tmux PID/start time in the same queue as shell creation via `if-shell -F`, avoiding configuration writes. The generation is not authentication and assumes no PID reuse within the same tmux start-time second.
+- Bypass `default-command` and pass the bridge account's HOME literally; refuse to start elsewhere. Shell startup files and tmux hooks still run.
 - Keep mutation requests bounded and fixed-length. Reject browser origins and send no CORS headers. Bound tmux concurrency, time, and output. Android uses fixed-length streaming and disables redirects to avoid automatic mutation replay.
 
 ## Pane previews
 
-- Advertise the optional pane ID only for eligible single-pane windows. Omit pane IDs rather than losing a previously listable inventory at either existing size limit. Keep contents out of inventory and use a separate read-only, fixed-length JSON POST with the existing browser-request checks. The method is not an authorization mechanism.
-- Check the full target and capture in one synchronous tmux queue. Refuse panes with an effective `after-capture-pane` hook rather than running local side effects or changing the user's tmux configuration. Return only the visible grid as plain text with `no-store`. Refuse an oversized capture rather than showing a partial screen.
+- The requester accepted that any reachable peer can read eligible panes without Android or per-pane setup. Keep pane contents on the [separate read route](connection-deployment.md#v1-http-contract). POST and browser checks do not authorize the caller.
+- Omit optional pane IDs rather than losing a previously listable inventory at either size limit.
+- Check the full target and capture in one synchronous tmux queue. Refuse an effective `after-capture-pane` hook to avoid side effects without changing tmux configuration.
 - Clear the preview across selection, lifecycle, or invalidation boundaries. Treat each tap as a distinct selection, even when the user returns to the same pane. Keep preview text in memory only. Secure the Android window before displaying pane text because the Recents-only API still showed preview pixels on the emulator. This also blocks screenshots and screen recording until the activity closes.
 
 ## Pane input
 
-- Gate input behind `--enable-pane-input`, not a new v1 snapshot field. Keep the listener on loopback by default. When enabled, reachability grants input to whatever application owns an eligible pane, not approval tied to a rendered prompt. Acknowledgement is tmux injection, not application processing.
-- Pass the request to tmux over stdin rather than process arguments. Check eligibility and inject in one synchronous queue, without touching tmux configuration or invoking a configured send-keys hook. The bridge does not log or save input, but tmux can keep commands in its own message history. Do not enter secrets through this endpoint.
+- `--enable-pane-input` is the sole server-side input enablement switch. The optional v1 `paneInputEnabled` field advertises it, not authorization. Prefer omitting the field (read-only Android) to displacing previously listable inventory or pane IDs at the size cap. See the [input contract and trust boundary](connection-deployment.md#pane-input-api).
+- Input reserves an idle Android HTTP worker or does not send. Busy reads may require another explicit tap; an action never waits behind a read to be sent later. Open shell shares the mutation gate.
+- Bind Android input to the selected pane and observed bridge revision. The revision is not sent as a new v1 target field; the server checks the existing exact tmux identities and input eligibility. An unobserved restart is not detectable by the client revision check.
+- Keep the worker and mutation gate across Android activity recreation so rotation cannot start a competing read or forget uncertainty. Do not restore the selection, preview, or draft. Process death does not preserve pending state or replay input.
+- Pass input to tmux over stdin, not process arguments. Check eligibility and inject in one synchronous queue without changing tmux configuration or invoking a send-keys hook.
 
 ## Constraints for optional work
 

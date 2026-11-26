@@ -1,6 +1,6 @@
 # tmux probe findings
 
-Both probes ran on disposable private sockets with tmux 3.8. Neither gates the current workflow or pane reading. See the [optional workspace direction](plan.md#optional-roadmap).
+Both tmux 3.8 probes used disposable private sockets. Neither gates the current workflow. See the [optional roadmap](plan.md#optional-roadmap).
 
 ## Probe tmux working-directory launch
 
@@ -22,9 +22,9 @@ Both probes ran on disposable private sockets with tmux 3.8. Neither gates the c
 | `new-window` | Removed after validation | 0 | Window `@2`, confirmed by inventory | `/home/lukas` |
 | `new-session` | Removed after validation, fresh socket | 0 | Session `$0`, confirmed by inventory | `/home/lukas` |
 
-**Follow-up:** Test a separate launcher that verifies the actual working directory before offering directory selection. A plain shell may fall back to home with a pane warning; Pi must not start on directory-entry failure.
+**Follow-up:** Test a separate launcher that verifies the actual cwd. Preserve the [shell and Pi fallback rules](decisions.md#constraints-for-optional-work).
 
-**Limitations:** This tests tmux 3.8 on this host with the specified path and a deterministic deletion between validation and launch. It does not establish the cause of the substitution, behavior on other versions, handling of unreadable directories, or behavior in other filesystem races.
+**Limits:** One host, version, path, and deterministic deletion between validation and launch. The cause, other versions, unreadable paths, and other races remain unverified.
 
 **Cleanup:** Run `kill-server` only on the three probe sockets, check that the probe servers and pane PIDs are gone, then leave and remove the temporary directory.
 
@@ -70,6 +70,6 @@ Both probes ran on disposable private sockets with tmux 3.8. Neither gates the c
 | Old `$0:@3` after restart, no generation | K + `$0:@2 target`, `$0:@3 replacement` | 1 | K + `$0:@2 target`, `$0:@3 replacement` |
 | Same old request, fresh generation | K + `$0:@2 target`, `$0:@3 replacement` | 1 | K + `$0:@2 target`, `$0:@3 replacement` |
 
-**Why it does not yield:** In tmux 3.8, [`if-shell -F`](https://github.com/tmux/tmux/blob/3.8/cmd-if-shell.c) evaluates the format synchronously and inserts only the selected branch immediately after itself in the same queue. It returns `CMD_RETURN_NORMAL` instead of starting a shell job or waiting. [`cmdq_next`](https://github.com/tmux/tmux/blob/3.8/cmd-queue.c) continues straight into the inserted command before [`server_loop`](https://github.com/tmux/tmux/blob/3.8/server.c) can service another queue or return to event processing. [`cmd-find`](https://github.com/tmux/tmux/blob/3.8/cmd-find.c) checks `session_has` for an explicit session and `@` window ID. [`kill-window`](https://github.com/tmux/tmux/blob/3.8/cmd-kill-window.c) resolves the same pair and synchronously kills that window. No separate invocation participates in the check or mutation.
+**Why it does not yield:** In tmux 3.8, [`if-shell -F`](https://github.com/tmux/tmux/blob/3.8/cmd-if-shell.c) inserts only the selected branch next in the same queue and returns `CMD_RETURN_NORMAL` without waiting. [`cmdq_next`](https://github.com/tmux/tmux/blob/3.8/cmd-queue.c) runs that branch before [`server_loop`](https://github.com/tmux/tmux/blob/3.8/server.c) can service another queue or event. [`cmd-find`](https://github.com/tmux/tmux/blob/3.8/cmd-find.c) checks `session_has` for the explicit session/window pair. [`kill-window`](https://github.com/tmux/tmux/blob/3.8/cmd-kill-window.c) resolves that same pair and closes it synchronously.
 
 **Limitations and follow-up:** The probe seeded the marker manually. If remote close is approved, define how to initialize or adopt a fresh marker before issuing close identities. Never restore an old marker into a replacement server. Map rejections to a domain error. The marker is not authentication against a local tmux user who can edit options. Recheck on supported versions and cover linked windows and final-window closure.

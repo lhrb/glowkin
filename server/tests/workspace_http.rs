@@ -23,6 +23,22 @@ const ENABLE_PANE_INPUT: &str = "--enable-pane-input";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
+fn snapshot_advertises_the_input_flag_as_a_boolean() {
+    let tmux = Tmux::new();
+    for enabled in [false, true] {
+        let bridge = if enabled {
+            Bridge::start_with_input(&tmux)
+        } else {
+            Bridge::start(&tmux)
+        };
+        let (status, body) = bridge.request("GET", SNAPSHOT, "", "");
+        assert_eq!(status, 200);
+        let snapshot: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(snapshot["paneInputEnabled"], enabled);
+    }
+}
+
+#[test]
 fn inventory_includes_pc_windows_and_keeps_their_ids_on_refresh() {
     let tmux = Tmux::new();
     tmux.run(&[
@@ -548,11 +564,11 @@ fn oversized_visible_capture_fails_without_partial_content_and_recovers() {
 }
 
 #[test]
-fn optional_pane_ids_do_not_displace_inventory_at_either_limit() {
+fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
     const LEGACY: &str =
         "#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{session_name}\t#{window_name}";
     const WITH_PANES: &str = "#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{session_name}\t#{window_name}";
-    for json_limit in [false, true] {
+    for (json_limit, panes_fit) in [(false, false), (true, false), (true, true)] {
         let tmux = Tmux::new();
         let name = if json_limit {
             "\"".repeat(2500)
@@ -595,14 +611,17 @@ fn optional_pane_ids_do_not_displace_inventory_at_either_limit() {
             // tmux repeats the session name per row; JSON includes it only once.
             tmux.run(&["rename-session", "-t", "work", &"s".repeat(80)]);
         }
-        let bridge = Bridge::start(&tmux);
+        let bridge = Bridge::start_with_input(&tmux);
         let (_, body) = bridge.request("GET", SNAPSHOT, "", "");
         let mut snapshot: Value = serde_json::from_str(&body).unwrap();
-        for window in snapshot["workspace"]["session"]["windows"]
-            .as_array_mut()
-            .unwrap()
-        {
-            assert!(window.as_object_mut().unwrap().remove("paneId").is_some());
+        snapshot.as_object_mut().unwrap().remove("paneInputEnabled");
+        if !panes_fit {
+            for window in snapshot["workspace"]["session"]["windows"]
+                .as_array_mut()
+                .unwrap()
+            {
+                assert!(window.as_object_mut().unwrap().remove("paneId").is_some());
+            }
         }
         let bytes = |format| tmux.run(&["list-windows", "-a", "-F", format]).len() + 1;
         let legacy_size = if json_limit {
@@ -625,10 +644,13 @@ fn optional_pane_ids_do_not_displace_inventory_at_either_limit() {
         let (status, body) = bridge.request("GET", SNAPSHOT, "", "");
         assert_eq!(status, 200);
         assert!(body.len() <= 65536);
+        let snapshot: Value = serde_json::from_str(&body).unwrap();
         if json_limit {
             assert_eq!(body.len(), 65536 - 8);
+            assert!(snapshot.get("paneInputEnabled").is_none());
+        } else {
+            assert_eq!(snapshot["paneInputEnabled"], true);
         }
-        let snapshot: Value = serde_json::from_str(&body).unwrap();
         let workspace = &snapshot["workspace"];
         assert_eq!(ready_windows(workspace), tmux.windows());
         assert!(
@@ -636,7 +658,7 @@ fn optional_pane_ids_do_not_displace_inventory_at_either_limit() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|w| w.get("paneId").is_none())
+                .all(|w| w.get("paneId").is_some() == panes_fit)
         );
         assert_eq!(bridge.open(&open_target(workspace), None), 204);
     }

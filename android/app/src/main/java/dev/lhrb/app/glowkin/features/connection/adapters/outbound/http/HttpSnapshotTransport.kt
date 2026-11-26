@@ -37,10 +37,21 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
 
     fun openShell(endpoint: Endpoint, target: SessionTarget): ChangeOutcome {
         val body = JSONObject().put("sessionId", target.id).put("generation", target.generation)
-            .toString().toByteArray(Charsets.UTF_8)
-        val connection = connection(endpoint, "/v1/workspace/open-shell")
+        return mutate(endpoint, "/v1/workspace/open-shell", body)
+    }
+
+    fun sendInput(endpoint: Endpoint, target: PaneTarget, input: PaneInput): ChangeOutcome {
+        val variant = when (input) {
+            is PaneInput.Text -> JSONObject().put("text", input.value)
+            is PaneInput.Key -> JSONObject().put("key", input.wireName)
+        }
+        return mutate(endpoint, "/v1/workspace/send-input", paneBody(target).put("input", variant))
+    }
+
+    private fun mutate(endpoint: Endpoint, path: String, body: JSONObject): ChangeOutcome {
+        val connection = connection(endpoint, path)
         try {
-            connection.postJson(body)
+            connection.postJson(body.toString().toByteArray(Charsets.UTF_8))
             return when (connection.responseCode) {
                 204 -> ChangeOutcome.APPLIED
                 409 -> ChangeOutcome.TARGET_UNAVAILABLE
@@ -54,10 +65,12 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
         }
     }
 
-    fun readPane(endpoint: Endpoint, target: PaneTarget): PaneRead {
-        val body = JSONObject().put("sessionId", target.session.id).put("generation", target.session.generation)
+    private fun paneBody(target: PaneTarget): JSONObject =
+        JSONObject().put("sessionId", target.session.id).put("generation", target.session.generation)
             .put("windowId", target.windowId).put("paneId", target.paneId)
-            .toString().toByteArray(Charsets.UTF_8)
+
+    fun readPane(endpoint: Endpoint, target: PaneTarget): PaneRead {
+        val body = paneBody(target).toString().toByteArray(Charsets.UTF_8)
         val connection = connection(endpoint, "/v1/workspace/read-pane")
         try {
             connection.setRequestProperty("Accept", "text/plain")
@@ -117,6 +130,7 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                 var versionSeen = false
                 var revision: String? = null
                 var workspace: Workspace? = null
+                var paneInputEnabled: Boolean? = null
                 reader.beginObject()
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
@@ -134,6 +148,12 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                             if (workspace != null) throw ConnectionFailure(ConnectionError.PROTOCOL)
                             workspace = reader.readWorkspace()
                         }
+                        "paneInputEnabled" -> {
+                            if (paneInputEnabled != null || reader.peek() != JsonToken.BOOLEAN) {
+                                throw ConnectionFailure(ConnectionError.PROTOCOL)
+                            }
+                            paneInputEnabled = reader.nextBoolean()
+                        }
                         else -> reader.skipValue()
                     }
                 }
@@ -141,7 +161,7 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
                 if (!versionSeen || revision.isNullOrEmpty() || reader.peek() != JsonToken.END_DOCUMENT) {
                     throw ConnectionFailure(ConnectionError.PROTOCOL)
                 }
-                return Snapshot(revision, workspace)
+                return Snapshot(revision, workspace, paneInputEnabled == true)
             }
         } catch (failure: ConnectionFailure) {
             throw failure

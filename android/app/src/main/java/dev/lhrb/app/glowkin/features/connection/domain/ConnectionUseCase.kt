@@ -3,7 +3,7 @@ package dev.lhrb.app.glowkin.features.connection.domain
 import dev.lhrb.app.glowkin.features.connection.domain.ports.EndpointStorePort
 import dev.lhrb.app.glowkin.features.connection.domain.ports.SnapshotTransportPort
 
-data class Snapshot(val revision: String, val workspace: Workspace? = null)
+data class Snapshot(val revision: String, val workspace: Workspace? = null, val paneInputEnabled: Boolean = false)
 
 sealed interface Workspace {
     data class Ready(val target: SessionTarget, val name: String, val windows: List<WorkspaceWindow>) : Workspace
@@ -21,10 +21,28 @@ sealed interface PaneRead {
     data object TargetUnavailable : PaneRead
     data object Failed : PaneRead
 }
+sealed interface PaneInput {
+    class Text(val value: String) : PaneInput {
+        init { require(isValid(value)) }
+
+        companion object {
+            fun isValid(value: String): Boolean = value.isNotEmpty() && value.length <= 256 &&
+                value.none { it.isISOControl() || it == '\u2028' || it == '\u2029' } &&
+                Charsets.UTF_8.newEncoder().canEncode(value) && value.toByteArray(Charsets.UTF_8).size <= 256
+        }
+    }
+
+    enum class Key(val wireName: String) : PaneInput {
+        ENTER("enter"), ESCAPE("escape"), UP("up"), DOWN("down"), LEFT("left"), RIGHT("right"),
+        BACKSPACE("backspace"), CTRL_O("ctrl-o"),
+    }
+}
+
 enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED }
 enum class ConnectionError { UNREACHABLE, PROTOCOL }
 class ConnectionFailure(val error: ConnectionError) : Exception(error.name)
 enum class ChangeOutcome { APPLIED, TARGET_UNAVAILABLE, REJECTED, UNCERTAIN, RECONCILIATION_REQUIRED, NOT_CONNECTED }
+enum class ChangeKind { OPEN_SHELL, PANE_INPUT }
 
 data class ConnectionState(
     val endpoint: Endpoint? = null,
@@ -34,6 +52,7 @@ data class ConnectionState(
     val error: ConnectionError? = null,
     val needsReconciliation: Boolean = false,
     val changeOutcome: ChangeOutcome? = null,
+    val changeKind: ChangeKind = ChangeKind.OPEN_SHELL,
 ) {
     val shellTarget: SessionTarget?
         get() = (snapshot?.workspace as? Workspace.Ready)?.target
@@ -45,6 +64,9 @@ data class ConnectionState(
         if (status != ConnectionStatus.CONNECTED || stale || window !in workspace.windows) return null
         return PaneTarget(workspace.target, window.id, pane)
     }
+
+    fun offersInput(target: PaneTarget, revision: String): Boolean =
+        snapshot?.let { it.revision == revision && it.paneInputEnabled } == true && canRead(target)
 
     fun canRead(target: PaneTarget): Boolean {
         val workspace = snapshot?.workspace as? Workspace.Ready ?: return false
@@ -108,8 +130,10 @@ class ConnectionUseCase(private val store: EndpointStorePort, private val transp
         state = state.copy(status = ConnectionStatus.DISCONNECTED, stale = state.snapshot != null, error = null)
     }
 
+    fun attemptChange(send: () -> ChangeOutcome): ChangeOutcome = attemptChange(ChangeKind.OPEN_SHELL, send)
+
     /** Never retain the callback: only a fresh explicit action may retry after reconciliation. */
-    fun attemptChange(send: () -> ChangeOutcome): ChangeOutcome {
+    fun attemptChange(kind: ChangeKind, send: () -> ChangeOutcome): ChangeOutcome {
         val token = synchronized(lock) {
             if (state.needsReconciliation || changeInFlight) return ChangeOutcome.RECONCILIATION_REQUIRED
             if (state.status != ConnectionStatus.CONNECTED) return ChangeOutcome.NOT_CONNECTED
@@ -124,10 +148,15 @@ class ConnectionUseCase(private val store: EndpointStorePort, private val transp
                     ChangeOutcome.UNCERTAIN -> {
                         // Reads begun before delivery became uncertain cannot reconcile it.
                         generation++
-                        state = state.copy(needsReconciliation = true, stale = state.snapshot != null, changeOutcome = outcome)
+                        state = state.copy(needsReconciliation = true, stale = state.snapshot != null,
+                            changeOutcome = outcome, changeKind = kind)
                     }
                     ChangeOutcome.APPLIED, ChangeOutcome.TARGET_UNAVAILABLE, ChangeOutcome.REJECTED -> {
-                        state = state.copy(changeOutcome = outcome)
+                        if (kind == ChangeKind.OPEN_SHELL) {
+                            state = state.copy(changeOutcome = outcome, changeKind = kind)
+                        } else if (state.changeKind == ChangeKind.PANE_INPUT) {
+                            state = state.copy(changeOutcome = null)
+                        }
                     }
                     ChangeOutcome.RECONCILIATION_REQUIRED, ChangeOutcome.NOT_CONNECTED -> Unit
                 }
