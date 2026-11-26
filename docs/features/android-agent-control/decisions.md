@@ -21,6 +21,11 @@
 - Check the full target and capture in one synchronous tmux queue. Refuse panes with an effective `after-capture-pane` hook rather than running local side effects or changing the user's tmux configuration. Return only the visible grid as plain text with `no-store`. Refuse an oversized capture rather than showing a partial screen.
 - Clear the preview across selection, lifecycle, or invalidation boundaries. Treat each tap as a distinct selection, even when the user returns to the same pane. Keep preview text in memory only. Secure the Android window before displaying pane text because the Recents-only API still showed preview pixels on the emulator. This also blocks screenshots and screen recording until the activity closes.
 
+## Pane input
+
+- Gate input behind `--enable-pane-input`, not a new v1 snapshot field. Keep the listener on loopback by default. When enabled, reachability grants input to whatever application owns an eligible pane, not approval tied to a rendered prompt. Acknowledgement is tmux injection, not application processing.
+- Pass the request to tmux over stdin rather than process arguments. Check eligibility and inject in one synchronous queue, without touching tmux configuration or invoking a configured send-keys hook. The bridge does not log or save input, but tmux can keep commands in its own message history. Do not enter secrets through this endpoint.
+
 ## Constraints for optional work
 
 These constraints apply if a direction is approved, not as authority for the current workflow.

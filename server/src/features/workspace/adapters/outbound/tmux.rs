@@ -1,8 +1,16 @@
 use std::{ffi::OsStr, fmt::Write, io, os::unix::ffi::OsStrExt, process::Stdio, time::Duration};
 
-use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Semaphore,
+    time::timeout,
+};
 
-use super::{OpenError, PaneTarget, ReadError, Session, Target, Window, Workspace};
+use super::{
+    InputError, OpenError, PaneInput, PaneInputCommand, PaneKey, PaneTarget, ReadError, Session,
+    Target, Window, Workspace,
+};
 
 const DEADLINE: Duration = Duration::from_secs(2);
 const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -96,13 +104,7 @@ impl Tmux {
             };
         }
         let error = String::from_utf8_lossy(&out.stderr);
-        if error.trim_end() == format!("can't find session: {id}")
-            || error.starts_with("no server running on ")
-            || (error.starts_with("error connecting to ")
-                && (error.trim_end().ends_with(" (No such file or directory)")
-                    || error.trim_end().ends_with(" (Connection refused)")
-                    || error.trim_end().ends_with(" (Permission denied)")))
-        {
+        if error.trim_end() == format!("can't find session: {id}") || no_server(&error) {
             Err(OpenError::Unavailable)
         } else {
             Err(OpenError::Uncertain)
@@ -147,7 +149,74 @@ impl Tmux {
         String::from_utf8(out.stdout).map_err(|_| ReadError::CaptureFailed)
     }
 
+    pub(crate) async fn send_input(&self, command: PaneInputCommand) -> Result<(), InputError> {
+        let PaneInputCommand { target, input } = command;
+        let session = target.session;
+        let sid = format!("${}", session.session_id);
+        let wid = format!("@{}", target.window_id);
+        let pane = format!("%{}", target.pane_id);
+        // if-shell can fall back to its client context when -t cannot resolve.
+        // Compare every ID and require explicit zeroes (missing flags expand to empty).
+        let checks = [
+            "#{==:#{server_sessions},1}".to_owned(),
+            format!(
+                "#{{==:#{{pid}}-#{{start_time}},{}-{}}}",
+                session.server_pid, session.server_start
+            ),
+            format!("#{{==:#{{session_id}},{sid}}}"),
+            format!("#{{==:#{{window_id}},{wid}}}"),
+            "#{==:#{window_panes},1}".to_owned(),
+            format!("#{{==:#{{pane_id}},{pane}}}"),
+            "#{==:#{pane_in_mode},0}".to_owned(),
+            "#{==:#{pane_dead},0}".to_owned(),
+            "#{==:#{pane_input_off},0}".to_owned(),
+            "#{==:#{after-send-keys},}".to_owned(),
+        ];
+        let guard = checks
+            .into_iter()
+            .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+            .unwrap();
+        // An explicit empty client avoids borrowing an attached PC client.
+        // A read-only attached client would otherwise fail and fire command-error.
+        let send = match input {
+            PaneInput::Text(text) => format!(
+                "send-keys -c '' -l -t {pane} -- {}",
+                quote_tmux_argument(OsStr::new(text.as_str()))
+            ),
+            PaneInput::Key(key) => format!("send-keys -c '' -t {pane} {}", input_key(key)),
+        };
+        // source-file reads stdin before running the guard. if-shell -F runs the
+        // parsed command block in the same queue, without yielding or reparsing text.
+        // list-commands has no configurable after hook, unlike display-message.
+        let script = format!(
+            "if-shell -F -t '{sid}:{wid}' \"{guard}\" {{ {send}; list-commands -F sent send-keys }} {{ list-commands -F rejected send-keys }}\n"
+        );
+        let out = self
+            .run_tmux(&["source-file", "-"], Some(script.as_bytes()))
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => InputError::Rejected,
+                _ => InputError::Uncertain,
+            })?;
+        match (out.status.success(), out.stdout.as_slice()) {
+            (true, b"sent\n") => Ok(()),
+            (true, b"rejected\n") => Err(InputError::Rejected),
+            (false, b"") if no_server(&String::from_utf8_lossy(&out.stderr)) => {
+                Err(InputError::Rejected)
+            }
+            _ => Err(InputError::Uncertain),
+        }
+    }
+
     async fn run(&self, args: &[&str]) -> io::Result<std::process::Output> {
+        self.run_tmux(args, None).await
+    }
+
+    async fn run_tmux(
+        &self,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> io::Result<std::process::Output> {
         let _slot = self.slots.try_acquire().map_err(io::Error::other)?;
         timeout(DEADLINE, async {
             let mut child = Command::new("tmux")
@@ -156,18 +225,34 @@ impl Tmux {
                 .env_remove("TMUX")
                 .env_remove("TMUX_PANE")
                 .env("LC_ALL", "C")
-                .stdin(Stdio::null())
+                .stdin(if stdin.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::null()
+                })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()?;
             let stdout = child.stdout.take().unwrap();
             let stderr = child.stderr.take().unwrap();
-            let (status, stdout, stderr) = tokio::try_join!(
+            let pipe = child.stdin.take();
+            let (status, stdout, stderr, written) = tokio::try_join!(
                 child.wait(),
                 read_bounded(stdout, io::ErrorKind::FileTooLarge),
                 read_bounded(stderr, io::ErrorKind::Other),
+                async move {
+                    let written = match (pipe, stdin) {
+                        (Some(mut pipe), Some(input)) => pipe.write_all(input).await,
+                        _ => Ok(()),
+                    };
+                    // Keep tmux's connection error if the client closes stdin early.
+                    Ok(written)
+                },
             )?;
+            if status.success() {
+                written?;
+            }
             Ok(std::process::Output {
                 status,
                 stdout,
@@ -175,6 +260,27 @@ impl Tmux {
             })
         })
         .await?
+    }
+}
+
+fn no_server(error: &str) -> bool {
+    error.starts_with("no server running on ")
+        || (error.starts_with("error connecting to ")
+            && (error.trim_end().ends_with(" (No such file or directory)")
+                || error.trim_end().ends_with(" (Connection refused)")
+                || error.trim_end().ends_with(" (Permission denied)")))
+}
+
+fn input_key(key: PaneKey) -> &'static str {
+    match key {
+        PaneKey::Enter => "Enter",
+        PaneKey::Escape => "Escape",
+        PaneKey::Up => "Up",
+        PaneKey::Down => "Down",
+        PaneKey::Left => "Left",
+        PaneKey::Right => "Right",
+        PaneKey::Backspace => "BSpace",
+        PaneKey::CtrlO => "C-o",
     }
 }
 

@@ -10,6 +10,7 @@ HTTP address-only access is **unauthenticated PC control for trusted networks on
 There is no login, pairing, token, TLS, or application-level authorization.
 **Any reachable peer can read eligible pane contents without the Android app.**
 Reachable peers can also read the window list and request a new shell window when exactly one session is available.
+Pane input is off by default. With `--enable-pane-input`, **any reachable peer can type into eligible panes and potentially execute commands as the pane's user**, without Android.
 WLAN alone does not authorize peers.
 Do not forward this port publicly or deploy behind a public ingress.
 Restrict the listener and firewall to intended peers; restrict Tailscale access with tailnet policy.
@@ -22,9 +23,8 @@ Do not change global firewall policy merely to make this example work.
 1. On the PC, start `tmux` if needed and leave exactly one session running. Create a window with `Ctrl+b c`.
 2. From the repository root, run `./server/run-server.sh --bind 192.168.1.10`, replacing the example address with the PC's trusted WLAN or Tailscale IP. The script builds and runs the release bridge with Cargo and forwards bridge flags. Omit `--bind` for loopback only.
 3. If needed, install the debug app on the connected Android device from the repository root: `cd android && ./gradlew :app:installDebug` (requires compile SDK 37).
-4. In Glowkin, enter the PC IP and port `8787`, then tap **Save and connect** or **Replace and connect**. Under **tmux workspace**, tap **Refresh** to check for PC-created windows. Tap **Open shell** and check on the PC that a new interactive shell opened at home in the same session.
-
-5. In a PC shell, run `printf 'first line\n    second line\n'`. Tap that window's name on Android. The selected pane preview shows both lines with the indentation and refreshes while Android is in the foreground. Selecting and reading a pane do not change PC focus or send input.
+4. In Glowkin, enter the PC IP and port `8787`, then tap **Save and connect** or **Replace and connect**. In **Session overview**, tap **Refresh** to check for PC-created windows. Tap **Open shell** and check on the PC that a new interactive shell opened at home in the same session. Use **Connection** to reach endpoint controls again.
+5. In a PC shell, run `printf 'first line\n    second line\n'`. Tap that window on Android. Its detail view shows both lines with the indentation and refreshes while Android is in the foreground. Press Back once to return to the window list and stop pane reads. Selecting and reading a pane do not change PC focus or send input.
 
 See [recorded verification](#recorded-verification) for what was checked.
 
@@ -37,6 +37,9 @@ cargo build --release --locked --manifest-path server/Cargo.toml
 
 # Safe default: loopback only, useful with adb forwarding.
 server/target/release/glowkin-bridge
+
+# Enable pane input for a local HTTP client; still loopback-only.
+server/target/release/glowkin-bridge --enable-pane-input
 
 # Substitute the PC's actual trusted WLAN interface address.
 server/target/release/glowkin-bridge --bind 192.168.1.10 --port 8787
@@ -66,11 +69,30 @@ Use the chosen bind address instead of loopback when necessary.
 Expect HTTP 200, `Content-Type: application/json`, and `Cache-Control: no-store`.
 The v1 snapshot requires integer `protocolVersion: 1` and a nonempty string `revision` that stays stable until the bridge restarts.
 Android ignores unknown fields and accepts older snapshots without `workspace`, but hides workspace controls.
-`POST /v1/workspace/open-shell` is the only mutation route.
+`POST /v1/workspace/open-shell` and the opt-in [pane input endpoint](#pane-input-api) are the mutation routes.
 `POST /v1/workspace/read-pane` is read-only. A fixed-length JSON body supplies `generation`, `sessionId`, `windowId`, and `paneId` from the inventory. Eligible windows advertise `paneId`. Older bridges, split windows, and windows with an effective tmux `after-capture-pane` hook omit it. Large inventories may omit pane IDs to preserve the window list.
 A successful read returns UTF-8 `text/plain` with `Cache-Control: no-store`. Stale or ineligible targets return 409 without content. An over-limit capture fails rather than presenting a partial screen.
 Unknown routes return 404; mutations to the snapshot route return 405.
 There is no remote disconnect route.
+
+## Pane input API
+
+`POST /v1/workspace/send-input` accepts fixed-length `Content-Type: application/json` with a body of at most 2,048 bytes. Use `generation`, `sessionId`, `windowId`, and `paneId` from one current snapshot; the values here are examples. A local client can use `curl --json`:
+
+```sh
+curl -i --json '{"generation":"1234-1700000000","sessionId":"$0","windowId":"@1","paneId":"%1","input":{"text":"hello π"}}' \
+  http://127.0.0.1:8787/v1/workspace/send-input
+```
+
+Send exactly one `input` variant. `{"text":"hello π"}` inserts 1–256 UTF-8 bytes on one line, literally, with no implicit Enter. Control characters and Unicode line/paragraph separators are rejected. `{"key":"enter"}` sends an explicit Enter. The other allowed keys are `escape`, `up`, `down`, `left`, `right`, `backspace`, and `ctrl-o`.
+
+Only the exact live, input-enabled pane in a single-pane window in the one existing session can receive input. A pane in a tmux mode is ineligible. The bridge does not change PC focus. Input goes to the application currently receiving keys, not to a particular prompt or screen. PC and remote typing share one editor; remote Enter can submit PC-typed text. Read the pane again to see echoed text. Pane reads do not reveal keystrokes that the application does not display. The bridge does not log or save input, but tmux can keep commands in its own message history, and terminal applications can log what they receive. Do not use this endpoint to enter secrets.
+
+- **204:** tmux injected input, not necessarily that the application processed it or that Pi made a decision.
+- **409:** The target was definitely rejected; the bridge did not inject input.
+- **503:** Delivery is uncertain. A lost connection or response can also leave delivery uncertain. Do not replay. Follow [mutation reconciliation](decisions.md#connection-and-delivery) before any fresh action.
+- **403:** Input is disabled or the request carries browser request headers (`Origin`, `Referer`, or `Sec-Fetch-*`). The bridge sends no CORS headers.
+- **400 / 408 / 413 / 415:** Invalid request, body-read timeout, oversized body, or unsupported media type, respectively.
 
 ## Android
 
@@ -142,3 +164,4 @@ adb -s emulator-5554 reverse --remove tcp:8787
 - **Single-session workspace, automated:** Seven bridge, 13 Android JVM, and seven emulator tests passed. Rust formatting, Clippy, both debug builds, and Android lint passed. The emulator refreshed PC-created windows through the real bridge and opened exactly one interactive shell at home in the same disposable session. Private-socket tests rejected unavailable and stale targets without retargeting. A later `cargo test --locked --manifest-path server/Cargo.toml --test workspace_http` rerun on tmux 3.8 passed all three tests without app changes.
 - **Single-session workspace, user confirmation:** **Open shell** creates a window on the PC; the user had expected an Android terminal. This confirms window creation, not the working directory or the other guarantees.
 - **Pane preview:** The emulator connected to the real release bridge over `adb reverse` and previewed a shell and an offline Pi TUI on disposable tmux 3.8. It preserved indentation, PC focus, and pending input. See the [slice verification](plan.md#read-a-selected-pc-tmux-pane-on-android) for rejection, compatibility, privacy, and coverage details. No physical-device or WLAN/Tailscale verification was performed for pane reading.
+- **Pane input:** The release bridge on loopback drove the real Pi permission dialog and shared editor on disposable tmux 3.8 with an offline model fixture. See the [slice verification](plan.md#drive-one-existing-pi-pane-through-the-bridge). Android input is not implemented.

@@ -14,14 +14,23 @@ use serde_json::{Value, json};
 use tokio::{net::TcpListener, time::timeout};
 
 use super::domain::Snapshot;
-use crate::features::workspace::{OpenError, PaneTarget, ReadError, Target, Tmux, Workspace};
+use crate::features::workspace::{
+    InputError, LiteralText, OpenError, PaneInput, PaneInputCommand, PaneKey, PaneTarget,
+    ReadError, Target, Tmux, Workspace,
+};
 
 const SNAPSHOT_PATH: &str = "/v1/connection/snapshot";
 const OPEN_PATH: &str = "/v1/workspace/open-shell";
 const READ_PATH: &str = "/v1/workspace/read-pane";
+const SEND_INPUT_PATH: &str = "/v1/workspace/send-input";
 const TARGET_BODY_LIMIT: usize = 256;
+const INPUT_BODY_LIMIT: usize = 2048;
 
-pub(super) async fn serve(listener: TcpListener, snapshot: Snapshot) -> io::Result<()> {
+pub(super) async fn serve(
+    listener: TcpListener,
+    snapshot: Snapshot,
+    enable_pane_input: bool,
+) -> io::Result<()> {
     let snapshot = Arc::new(snapshot);
     let tmux = Arc::new(Tmux::new());
     let mut http = http1::Builder::new();
@@ -36,7 +45,9 @@ pub(super) async fn serve(listener: TcpListener, snapshot: Snapshot) -> io::Resu
         let service = service_fn(move |request| {
             let snapshot = Arc::clone(&snapshot);
             let tmux = Arc::clone(&tmux);
-            async move { Ok::<_, Infallible>(respond(request, &snapshot, &tmux).await) }
+            async move {
+                Ok::<_, Infallible>(respond(request, &snapshot, &tmux, enable_pane_input).await)
+            }
         });
         let connection = http.serve_connection(TokioIo::new(stream), service);
         tokio::spawn(async move {
@@ -50,6 +61,7 @@ async fn respond(
     request: Request<Incoming>,
     snapshot: &Snapshot,
     tmux: &Tmux,
+    enable_pane_input: bool,
 ) -> Response<Full<Bytes>> {
     let method = request.method();
     if !matches!(
@@ -63,7 +75,7 @@ async fn respond(
     let path = request.uri().path_and_query().map(|target| target.as_str());
     let allowed = match path {
         Some(SNAPSHOT_PATH) => Method::GET,
-        Some(OPEN_PATH | READ_PATH) => Method::POST,
+        Some(OPEN_PATH | READ_PATH | SEND_INPUT_PATH) => Method::POST,
         _ => return empty(StatusCode::NOT_FOUND),
     };
     if *method != allowed {
@@ -78,6 +90,12 @@ async fn respond(
     match path {
         Some(OPEN_PATH) => return empty(open_shell(request, tmux).await),
         Some(READ_PATH) => return pane_response(read_pane(request, tmux).await),
+        Some(SEND_INPUT_PATH) => {
+            if !enable_pane_input {
+                return empty(StatusCode::FORBIDDEN);
+            }
+            return empty(send_input(request, tmux).await);
+        }
         _ => (),
     }
 
@@ -154,6 +172,23 @@ struct PaneRequest {
     pane_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SendInputRequest {
+    session_id: String,
+    generation: String,
+    window_id: String,
+    pane_id: String,
+    input: InputRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum InputRequest {
+    Text(String),
+    Key(String),
+}
+
 fn decimal<T: std::str::FromStr>(value: &str) -> Option<T> {
     if !value.bytes().all(|byte| byte.is_ascii_digit())
         || (value.len() > 1 && value.starts_with('0'))
@@ -172,9 +207,30 @@ fn session_target(id: &str, generation: &str) -> Option<Target> {
     })
 }
 
+fn pane_target(
+    session_id: &str,
+    generation: &str,
+    window_id: &str,
+    pane_id: &str,
+) -> Option<PaneTarget> {
+    Some(PaneTarget {
+        session: session_target(session_id, generation)?,
+        window_id: decimal(window_id.strip_prefix('@')?)?,
+        pane_id: decimal(pane_id.strip_prefix('%')?)?,
+    })
+}
+
 async fn read_target<T: serde::de::DeserializeOwned>(
     request: Request<Incoming>,
 ) -> Result<T, StatusCode> {
+    let body = read_json_body(request, TARGET_BODY_LIMIT).await?;
+    serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+async fn read_json_body(
+    request: Request<Incoming>,
+    body_limit: usize,
+) -> Result<Bytes, StatusCode> {
     let headers = request.headers();
     if headers.contains_key(header::ORIGIN)
         || headers.contains_key(header::REFERER)
@@ -203,12 +259,12 @@ async fn read_target<T: serde::de::DeserializeOwned>(
     if headers.contains_key(header::TRANSFER_ENCODING) || lengths.next().is_some() || length == 0 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if length > TARGET_BODY_LIMIT {
+    if length > body_limit {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     let body = match timeout(
         Duration::from_secs(2),
-        Limited::new(request.into_body(), TARGET_BODY_LIMIT).collect(),
+        Limited::new(request.into_body(), body_limit).collect(),
     )
     .await
     {
@@ -219,7 +275,7 @@ async fn read_target<T: serde::de::DeserializeOwned>(
     if body.len() != length {
         return Err(StatusCode::BAD_REQUEST);
     }
-    serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)
+    Ok(body)
 }
 
 async fn open_shell(request: Request<Incoming>, tmux: &Tmux) -> StatusCode {
@@ -239,24 +295,61 @@ async fn open_shell(request: Request<Incoming>, tmux: &Tmux) -> StatusCode {
 
 async fn read_pane(request: Request<Incoming>, tmux: &Tmux) -> Result<String, StatusCode> {
     let request: PaneRequest = read_target(request).await?;
-    let target = PaneTarget {
-        session: session_target(&request.session_id, &request.generation)
-            .ok_or(StatusCode::BAD_REQUEST)?,
-        window_id: request
-            .window_id
-            .strip_prefix('@')
-            .and_then(decimal)
-            .ok_or(StatusCode::BAD_REQUEST)?,
-        pane_id: request
-            .pane_id
-            .strip_prefix('%')
-            .and_then(decimal)
-            .ok_or(StatusCode::BAD_REQUEST)?,
-    };
+    let target = pane_target(
+        &request.session_id,
+        &request.generation,
+        &request.window_id,
+        &request.pane_id,
+    )
+    .ok_or(StatusCode::BAD_REQUEST)?;
     tmux.read_pane(target).await.map_err(|error| match error {
         ReadError::TargetUnavailable => StatusCode::CONFLICT,
         ReadError::CaptureFailed => StatusCode::SERVICE_UNAVAILABLE,
     })
+}
+
+async fn send_input(request: Request<Incoming>, tmux: &Tmux) -> StatusCode {
+    let body = match read_json_body(request, INPUT_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(status) => return status,
+    };
+    let Some(command) = input_command(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match tmux.send_input(command).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(InputError::Rejected) => StatusCode::CONFLICT,
+        Err(InputError::Uncertain) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+fn input_command(body: &[u8]) -> Option<PaneInputCommand> {
+    // Serde also accepts positional arrays for structs, but this endpoint requires an object.
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return None;
+    }
+    let request: SendInputRequest = serde_json::from_slice(body).ok()?;
+    let target = pane_target(
+        &request.session_id,
+        &request.generation,
+        &request.window_id,
+        &request.pane_id,
+    )?;
+    let input = match request.input {
+        InputRequest::Text(text) => PaneInput::Text(LiteralText::new(text)?),
+        InputRequest::Key(key) => PaneInput::Key(match key.as_str() {
+            "enter" => PaneKey::Enter,
+            "escape" => PaneKey::Escape,
+            "up" => PaneKey::Up,
+            "down" => PaneKey::Down,
+            "left" => PaneKey::Left,
+            "right" => PaneKey::Right,
+            "backspace" => PaneKey::Backspace,
+            "ctrl-o" => PaneKey::CtrlO,
+            _ => return None,
+        }),
+    };
+    Some(PaneInputCommand { target, input })
 }
 
 fn pane_response(result: Result<String, StatusCode>) -> Response<Full<Bytes>> {
@@ -286,4 +379,96 @@ fn empty(status: StatusCode) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::default());
     *response.status_mut() = status;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDENTITY: &str = r#""sessionId":"$1","generation":"2-3","windowId":"@4","paneId":"%5""#;
+
+    fn parse_input(input: &str) -> Option<PaneInputCommand> {
+        input_command(format!(r#"{{{IDENTITY},"input":{input}}}"#).as_bytes())
+    }
+
+    #[test]
+    fn maps_identity_and_preserves_literal_text() {
+        let command = parse_input(r#"{"text":" π -- ; Enter "}"#).unwrap();
+        assert_eq!(command.target.session.session_id, 1);
+        assert_eq!(command.target.session.server_pid, 2);
+        assert_eq!(command.target.session.server_start, 3);
+        assert_eq!(command.target.window_id, 4);
+        assert_eq!(command.target.pane_id, 5);
+        let PaneInput::Text(text) = command.input else {
+            panic!("expected literal text");
+        };
+        assert_eq!(text.as_str(), " π -- ; Enter ");
+    }
+
+    #[test]
+    fn maps_exact_key_names() {
+        for name in [
+            "enter",
+            "escape",
+            "up",
+            "down",
+            "left",
+            "right",
+            "backspace",
+            "ctrl-o",
+        ] {
+            let command = parse_input(&format!(r#"{{"key":"{name}"}}"#)).unwrap();
+            assert!(matches!(
+                (name, command.input),
+                ("enter", PaneInput::Key(PaneKey::Enter))
+                    | ("escape", PaneInput::Key(PaneKey::Escape))
+                    | ("up", PaneInput::Key(PaneKey::Up))
+                    | ("down", PaneInput::Key(PaneKey::Down))
+                    | ("left", PaneInput::Key(PaneKey::Left))
+                    | ("right", PaneInput::Key(PaneKey::Right))
+                    | ("backspace", PaneInput::Key(PaneKey::Backspace))
+                    | ("ctrl-o", PaneInput::Key(PaneKey::CtrlO))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_input_payloads() {
+        for input in [
+            r#"{}"#,
+            r#"null"#,
+            r#""enter""#,
+            r#"{"text":null}"#,
+            r#"{"text":true}"#,
+            r#"{"text":""}"#,
+            r#"{"text":"line\nend"}"#,
+            r#"{"text":"\u001b[A"}"#,
+            r#"{"key":null}"#,
+            r#"{"key":{"enter":null}}"#,
+            r#"{"key":"Enter"}"#,
+            r#"{"key":"ctrl+o"}"#,
+            r#"{"Key":"enter"}"#,
+            r#"{"key":"enter","text":"x"}"#,
+            r#"{"key":"enter","key":"escape"}"#,
+            r#"{"key":"enter","extra":true}"#,
+        ] {
+            assert!(parse_input(input).is_none(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_request_objects() {
+        for body in [
+            format!(r#"{{{IDENTITY}}}"#),
+            format!(r#"{{{IDENTITY},"input":{{"text":"x"}},"input":{{"key":"enter"}}}}"#),
+            format!(r#"{{{IDENTITY},"input":{{"key":"enter"}},"paneId":"%6"}}"#),
+            format!(r#"{{{IDENTITY},"input":{{"key":"enter"}},"extra":true}}"#),
+            format!(r#"{{{IDENTITY},"input":{{"key":"enter"}}}} {{}}"#),
+            r#"["$1","2-3","@4","%5",{"key":"enter"}]"#.to_owned(),
+            r#"{"sessionId":"$1","generation":"2-3","windowId":"@4","input":{"key":"enter"}}"#.to_owned(),
+            r#"{"sessionId":"$1","generation":"2-3","windowId":"@4","paneId":"%05","input":{"key":"enter"}}"#.to_owned(),
+        ] {
+            assert!(input_command(body.as_bytes()).is_none(), "accepted {body}");
+        }
+    }
 }

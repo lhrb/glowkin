@@ -18,6 +18,8 @@ use uuid::Uuid;
 const SNAPSHOT: &str = "/v1/connection/snapshot";
 const OPEN_SHELL: &str = "/v1/workspace/open-shell";
 const READ_PANE: &str = "/v1/workspace/read-pane";
+const SEND_INPUT: &str = "/v1/workspace/send-input";
+const ENABLE_PANE_INPUT: &str = "--enable-pane-input";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
@@ -652,9 +654,9 @@ fn stalled_tmux_capture_times_out_and_the_next_read_succeeds() {
         "focus",
         "/bin/sleep 300",
     ]);
-    let wrapper = tmux.dir.join("tmux");
-    fs::write(
-        &wrapper,
+    let bridge = Bridge::start_with_tmux_wrapper(
+        &tmux,
+        &[],
         r#"#!/bin/sh
 case "$*" in
     *"capture-pane -p"*) if [ ! -e stalled ]; then : > stalled; exec /bin/sleep 15; fi ;;
@@ -662,21 +664,526 @@ esac
 PATH=${PATH#*:}; export PATH
 exec tmux "$@"
 "#,
-    )
-    .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(tmux.dir.clone())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let mut command = tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge"));
-    command.env("PATH", path);
-    let bridge = Bridge::start_command(command);
+    );
     let target = pane_target(&bridge.workspace(), "focus");
     assert_eq!(bridge.read(&target, ""), (503, String::new()));
     assert!(tmux.dir.join("stalled").exists());
     assert_eq!(bridge.read(&target, "").0, 200);
+}
+
+#[test]
+fn pane_input_is_off_by_default() {
+    let tmux = Tmux::new();
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "work", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start(&tmux);
+    let target = pane_target(&bridge.workspace(), "target");
+    assert_eq!(
+        bridge.send_input(&target, json!({"text": "blocked"}), ""),
+        (403, String::new())
+    );
+    tmux.assert_reader_received_only_probe(&target, "reader");
+}
+
+#[test]
+fn pane_input_sends_exact_text_and_keys_without_enter_or_focus_change() {
+    let tmux = Tmux::new();
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "work", "-n", "focus"],
+        "focus-reader",
+    );
+    tmux.start_reader(
+        &["new-window", "-d", "-t", "work:", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_input(&tmux);
+    let workspace = bridge.workspace();
+    let target = pane_target(&workspace, "target");
+    let focused = pane_target(&workspace, "focus");
+    let focus = || {
+        tmux.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            "work:",
+            "#{window_id}:#{pane_id}",
+        ])
+    };
+    let before = focus();
+    assert_eq!(
+        before,
+        format!(
+            "{}:{}",
+            focused["windowId"].as_str().unwrap(),
+            focused["paneId"].as_str().unwrap()
+        )
+    );
+
+    let mut expected = Vec::new();
+    for text in [
+        "  Grüße 🙂 東京 ",
+        ";",
+        "-t",
+        "--",
+        r#"  '" \n \e \033 \; $HOME $(touch unexpected) `touch unexpected` #{pane_id} ;  "#,
+    ] {
+        assert_eq!(
+            bridge.send_input(&target, json!({"text": text}), ""),
+            (204, String::new()),
+            "{text:?}"
+        );
+        expected.extend_from_slice(text.as_bytes());
+    }
+    tmux.assert_reader_bytes("reader", &expected);
+    for (key, bytes) in [
+        ("enter", b"\r".as_slice()),
+        ("escape", b"\x1b"),
+        ("up", b"\x1b[A"),
+        ("down", b"\x1b[B"),
+        ("left", b"\x1b[D"),
+        ("right", b"\x1b[C"),
+        ("backspace", b"\x7f"),
+        ("ctrl-o", b"\x0f"),
+    ] {
+        assert_eq!(
+            bridge.send_input(&target, json!({"key": key}), ""),
+            (204, String::new()),
+            "{key}"
+        );
+        expected.extend_from_slice(bytes);
+        tmux.assert_reader_bytes("reader", &expected);
+    }
+    tmux.send_reader_probe(&target);
+    expected.extend_from_slice(b"probe");
+    tmux.assert_reader_bytes("reader", &expected);
+    tmux.assert_reader_received_only_probe(&focused, "focus-reader");
+    assert!(!tmux.dir.join("unexpected").exists());
+    assert_eq!(focus(), before);
+    let (status, screen) = bridge.read(&target, "");
+    assert_eq!(status, 200);
+    assert!(screen.contains("reader-ready"));
+    assert!(!screen.contains("Grüße"), "the reader did not echo input");
+}
+
+#[test]
+fn pane_input_enforces_payload_and_mutation_request_limits() {
+    let tmux = Tmux::new();
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "work", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_input(&tmux);
+    let target = pane_target(&bridge.workspace(), "target");
+    for input in [
+        json!(null),
+        json!("enter"),
+        json!({}),
+        json!({"text": "", "key": "enter"}),
+        json!({"text": "blocked", "extra": false}),
+        json!({"text": 1}),
+        json!({"text": ""}),
+        json!({"text": "é".repeat(129)}),
+        json!({"key": "Enter"}),
+        json!({"key": "C-o"}),
+        json!({"key": "tab"}),
+    ] {
+        assert_eq!(
+            bridge.send_input(&target, input.clone(), ""),
+            (400, String::new()),
+            "{input}"
+        );
+    }
+    for invalid in [
+        '\0', '\n', '\r', '\t', '\x1b', '\x7f', '\u{85}', '\u{2028}', '\u{2029}',
+    ] {
+        assert_eq!(
+            bridge.send_input(
+                &target,
+                json!({"text": format!("before{invalid}after")}),
+                ""
+            ),
+            (400, String::new()),
+            "{invalid:?}"
+        );
+    }
+    let mut invalid_target = target.clone();
+    invalid_target["paneId"] = json!("%01");
+    assert_eq!(
+        bridge
+            .send_input(&invalid_target, json!({"key": "enter"}), "")
+            .0,
+        400
+    );
+    invalid_target = target.clone();
+    invalid_target["extra"] = json!(false);
+    assert_eq!(
+        bridge
+            .send_input(&invalid_target, json!({"key": "enter"}), "")
+            .0,
+        400
+    );
+    for header in [
+        "Origin: null\r\n",
+        "Referer: http://browser.example/\r\n",
+        "Sec-Fetch-Mode: cors\r\n",
+    ] {
+        assert_eq!(
+            bridge.send_input(&target, json!({"text": "blocked"}), header),
+            (403, String::new())
+        );
+    }
+
+    let send = |body: &str, headers: &str| bridge.request("POST", SEND_INPUT, headers, body);
+    let fixed_length = |body: &str| {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
+    let mut request = target;
+    request["input"] = json!({"text": "blocked"});
+    let body = request.to_string();
+    let length = body.len();
+    for headers in [
+        format!("Content-Length: {length}\r\n"),
+        format!("Content-Type: application/json; charset=utf-8\r\nContent-Length: {length}\r\n"),
+        format!("{}Content-Type: application/json\r\n", fixed_length(&body)),
+    ] {
+        assert_eq!(send(&body, &headers), (415, String::new()), "{headers:?}");
+    }
+    assert_eq!(
+        send("", "Content-Type: application/json\r\n"),
+        (400, String::new())
+    );
+    assert_eq!(
+        send(
+            &format!("{length:x}\r\n{body}\r\n0\r\n\r\n"),
+            "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n"
+        ),
+        (400, String::new())
+    );
+    let duplicate = body.replace("\"text\":", "\"text\":\"duplicate\",\"text\":");
+    assert_eq!(
+        send(&duplicate, &fixed_length(&duplicate)),
+        (400, String::new())
+    );
+
+    let max_text = "é".repeat(128);
+    request["input"] = json!({"text": max_text});
+    let body = request.to_string();
+    let max_body = format!("{body}{}", " ".repeat(2048 - body.len()));
+    let too_large = format!("{max_body} ");
+    assert_eq!(
+        send(&too_large, &fixed_length(&too_large)),
+        (413, String::new())
+    );
+    assert_eq!(
+        send(&max_body, &fixed_length(&max_body)),
+        (204, String::new())
+    );
+    tmux.assert_reader_bytes("reader", max_text.as_bytes());
+}
+
+#[test]
+fn pane_input_rejects_stale_and_ineligible_topology_without_retargeting() {
+    let tmux = Tmux::new();
+    let setup = |focus, target| {
+        tmux.start_reader(&["new-session", "-d", "-s", "work", "-n", "focus"], focus);
+        tmux.start_reader(&["new-window", "-d", "-t", "work:", "-n", "target"], target);
+    };
+    setup("focus-reader", "original-reader");
+    let bridge = Bridge::start_with_input(&tmux);
+    let workspace = bridge.workspace();
+    let target = pane_target(&workspace, "target");
+    let focus = pane_target(&workspace, "focus");
+    let reject = |target: &Value, scenario: &str| {
+        assert_eq!(
+            bridge.send_input(target, json!({"text": "blocked"}), ""),
+            (409, String::new()),
+            "{scenario}: {target}"
+        );
+    };
+    for (field, value) in [
+        ("sessionId", json!("$99")),
+        ("windowId", json!("@99")),
+        ("windowId", focus["windowId"].clone()),
+        ("paneId", json!("%99")),
+        ("paneId", focus["paneId"].clone()),
+    ] {
+        let mut wrong = target.clone();
+        wrong[field] = value;
+        reject(&wrong, field);
+    }
+
+    let wid = target["windowId"].as_str().unwrap();
+    let split = tmux.start_reader(&["split-window", "-d", "-t", wid], "replacement-reader");
+    reject(&target, "split window");
+    tmux.assert_reader_received_only_probe(&target, "original-reader");
+    tmux.assert_reader_received_only_probe(&focus, "focus-reader");
+    tmux.run(&["kill-pane", "-t", target["paneId"].as_str().unwrap()]);
+    reject(&target, "replaced pane in the same window");
+    let replacement = pane_target(&bridge.workspace(), "target");
+    assert_eq!(replacement["paneId"], split);
+
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "other", "-n", "other"],
+        "other-reader",
+    );
+    reject(&replacement, "multiple sessions");
+    tmux.run(&["move-window", "-s", wid, "-t", "other:"]);
+    tmux.run(&["kill-session", "-t", "work"]);
+    reject(&replacement, "pane moved to another session");
+    let workspace = bridge.workspace();
+    let moved = pane_target(&workspace, "target");
+    assert_eq!(moved["paneId"], split);
+    assert_ne!(moved["sessionId"], replacement["sessionId"]);
+    tmux.assert_reader_received_only_probe(&moved, "replacement-reader");
+    tmux.assert_reader_received_only_probe(&pane_target(&workspace, "other"), "other-reader");
+    tmux.run(&["kill-window", "-t", wid]);
+    reject(&moved, "window gone");
+
+    tmux.run(&["kill-server"]);
+    let deadline = Instant::now() + TIMEOUT;
+    while tmux.server_is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "private tmux server did not stop"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    reject(&target, "server gone");
+    assert!(!tmux.server_is_running(), "POST started a tmux server");
+    setup("new-focus-reader", "new-target-reader");
+    let workspace = bridge.workspace();
+    let restarted = pane_target(&workspace, "target");
+    for field in ["sessionId", "windowId", "paneId"] {
+        assert_eq!(restarted[field], target[field]);
+    }
+    assert_ne!(restarted["generation"], target["generation"]);
+    reject(&target, "reused IDs on a new server");
+    tmux.assert_reader_received_only_probe(&restarted, "new-target-reader");
+    tmux.assert_reader_received_only_probe(&pane_target(&workspace, "focus"), "new-focus-reader");
+}
+
+#[test]
+fn pane_input_rejects_input_disabled_modal_and_dead_panes() {
+    let tmux = Tmux::new();
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "work", "-n", "focus"],
+        "focus-reader",
+    );
+    let pane = tmux.start_reader(
+        &["new-window", "-d", "-t", "work:", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_input(&tmux);
+    let workspace = bridge.workspace();
+    let target = pane_target(&workspace, "target");
+    let reject = |input: Value, scenario: &str| {
+        assert_eq!(
+            bridge.send_input(&target, input, ""),
+            (409, String::new()),
+            "{scenario}"
+        );
+    };
+    let state = |format| tmux.run(&["display-message", "-p", "-t", &pane, format]);
+
+    tmux.run(&["select-pane", "-d", "-t", &pane]);
+    assert_eq!(state("#{pane_input_off}"), "1");
+    reject(json!({"text": "blocked"}), "input disabled");
+    assert_eq!(state("#{pane_input_off}"), "1");
+    tmux.run(&["select-pane", "-e", "-t", &pane]);
+
+    tmux.run(&["copy-mode", "-t", &pane]);
+    assert_eq!(state("#{pane_in_mode}"), "1");
+    reject(json!({"key": "escape"}), "copy mode");
+    assert_eq!(state("#{pane_in_mode}"), "1", "POST drove tmux UI");
+    tmux.run(&["send-keys", "-X", "-t", &pane, "cancel"]);
+    tmux.assert_reader_received_only_probe(&target, "reader");
+
+    tmux.run(&["set-option", "-p", "-t", &pane, "remain-on-exit", "on"]);
+    tmux.run(&["respawn-pane", "-k", "-t", &pane, "/bin/false"]);
+    let deadline = Instant::now() + TIMEOUT;
+    while state("#{pane_dead}") != "1" {
+        assert!(Instant::now() < deadline, "pane did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let before = tmux.panes();
+    reject(json!({"text": "blocked"}), "dead pane");
+    assert_eq!(tmux.panes(), before);
+    tmux.assert_reader_received_only_probe(&pane_target(&workspace, "focus"), "focus-reader");
+}
+
+#[test]
+fn pane_input_cannot_trigger_configured_send_keys_hooks() {
+    let tmux = Tmux::new();
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "-n",
+        "focus",
+        "/bin/sleep 300",
+    ]);
+    let pane = tmux.start_reader(
+        &["new-window", "-d", "-t", "work:", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_input(&tmux);
+    let target = pane_target(&bridge.workspace(), "target");
+    let wid = target["windowId"].as_str().unwrap();
+    let focus = || tmux.run(&["display-message", "-p", "-t", "work:", "#{window_name}"]);
+    assert_eq!(focus(), "focus");
+    let change_focus = format!("select-window -t 'work:{wid}'");
+    for options in [
+        vec!["-g"],
+        vec!["-t", "work"],
+        vec!["-w", "-t", wid],
+        vec!["-p", "-t", &pane],
+    ] {
+        let hook = "after-send-keys[77]";
+        let mut set = vec!["set-hook"];
+        set.extend(&options);
+        set.extend([hook, &change_focus]);
+        tmux.run(&set);
+        let response = bridge.send_input(&target, json!({"key": "enter"}), "");
+        assert_eq!(focus(), "focus", "POST ran {hook} at {options:?}");
+        assert_eq!(response, (409, String::new()), "{options:?}");
+        let mut unset = vec!["set-hook", "-u"];
+        unset.extend(options);
+        unset.push(hook);
+        tmux.run(&unset);
+    }
+    tmux.assert_reader_received_only_probe(&target, "reader");
+}
+
+#[test]
+fn pane_input_ignores_the_attached_read_only_tmux_client() {
+    let tmux = Tmux::new();
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "-n",
+        "focus",
+        "/bin/sleep 300",
+    ]);
+    tmux.start_reader(
+        &["new-window", "-d", "-t", "work:", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_input(&tmux);
+    let target = pane_target(&bridge.workspace(), "target");
+    // Control mode provides an attached client without requiring a test-side PTY.
+    let mut client = tmux
+        .tmux()
+        .args(["-C", "attach-session", "-r", "-t", "work"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while tmux.run(&["list-clients", "-F", "#{client_readonly}"]) != "1" {
+        assert!(
+            Instant::now() < deadline,
+            "read-only tmux client did not attach"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let hooks = ["command-error", "after-display-message"];
+    for hook in hooks {
+        tmux.run(&[
+            "set-hook",
+            "-g",
+            hook,
+            &format!("set-option -g @{hook} hit"),
+        ]);
+    }
+
+    let text = "-β🙂;";
+    let text_response = bridge.send_input(&target, json!({"text": text}), "");
+    let key_response = bridge.send_input(&target, json!({"key": "enter"}), "");
+    // Closing control stdin detaches the client after both requests have completed.
+    assert!(client.wait().unwrap().success());
+    for hook in hooks {
+        assert_eq!(
+            tmux.run(&["show-options", "-gqv", &format!("@{hook}")]),
+            "",
+            "POST ran {hook}"
+        );
+    }
+    assert_eq!(text_response, (204, String::new()));
+    assert_eq!(key_response, (204, String::new()));
+    tmux.assert_reader_bytes("reader", format!("{text}\r").as_bytes());
+    assert_eq!(
+        tmux.run(&[
+            "list-windows",
+            "-t",
+            "work",
+            "-f",
+            "#{window_active}",
+            "-F",
+            "#{window_name}"
+        ]),
+        "focus"
+    );
+}
+
+#[test]
+fn pane_input_deadline_is_uncertain_without_replaying_a_delivered_write() {
+    let tmux = Tmux::new();
+    tmux.start_reader(
+        &["new-session", "-d", "-s", "work", "-n", "target"],
+        "reader",
+    );
+    let bridge = Bridge::start_with_tmux_wrapper(
+        &tmux,
+        &[ENABLE_PANE_INPUT],
+        r#"#!/bin/sh
+PATH=${PATH#*:}; export PATH
+case "$*" in
+    *"source-file -")
+        if [ ! -e input-attempts ]; then
+            echo first >> input-attempts
+            tmux "$@" >/dev/null || exit $?
+            : > delivered
+            exec /bin/sleep 15
+        fi
+        echo next >> input-attempts
+        ;;
+esac
+exec tmux "$@"
+"#,
+    );
+    let target = pane_target(&bridge.workspace(), "target");
+    assert_eq!(
+        bridge.send_input(&target, json!({"text": "first"}), ""),
+        (503, String::new())
+    );
+    assert!(
+        tmux.dir.join("delivered").exists(),
+        "wrapper did not complete the tmux command"
+    );
+    tmux.assert_reader_bytes("reader", b"first");
+    assert_eq!(bridge.read(&target, "").0, 200);
+    let attempts = || fs::read_to_string(tmux.dir.join("input-attempts")).unwrap();
+    assert_eq!(
+        attempts(),
+        "first\n",
+        "bridge retried an uncertain mutation"
+    );
+
+    // This is a fresh action after reconciliation, not a replay of the uncertain input.
+    assert_eq!(
+        bridge.send_input(&target, json!({"text": "next"}), ""),
+        (204, String::new())
+    );
+    tmux.assert_reader_bytes("reader", b"firstnext");
+    assert_eq!(attempts(), "first\nnext\n");
 }
 
 fn window_named<'a>(workspace: &'a Value, name: &str) -> &'a Value {
@@ -803,6 +1310,55 @@ impl Tmux {
             .to_owned()
     }
 
+    fn start_reader(&self, args: &[&str], output: &str) -> String {
+        let mut args = args.to_vec();
+        args.extend([
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-c",
+            self.dir.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            r#"stty raw -echo && printf 'reader-ready\n' && exec /bin/cat > "$1""#,
+            "glowkin-reader",
+            output,
+        ]);
+        let pane = self.run(&args);
+        self.wait_for_screen(&pane, "reader-ready");
+        pane
+    }
+
+    fn assert_reader_bytes(&self, output: &str, expected: &[u8]) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let bytes = fs::read(self.dir.join(output)).unwrap_or_default();
+            assert!(
+                expected.starts_with(&bytes),
+                "{output}: expected {expected:?}, received {bytes:?}"
+            );
+            if bytes == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{output}: expected {expected:?}, received {bytes:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_reader_received_only_probe(&self, target: &Value, output: &str) {
+        // A direct write proves the reader is live and follows any earlier pane input in order.
+        self.send_reader_probe(target);
+        self.assert_reader_bytes(output, b"probe");
+    }
+
+    fn send_reader_probe(&self, target: &Value) {
+        let pane = target["paneId"].as_str().unwrap();
+        self.run(&["send-keys", "-l", "-t", pane, "probe"]);
+    }
+
     fn wait_for_screen(&self, pane: &str, marker: &str) {
         let deadline = Instant::now() + TIMEOUT;
         while !self
@@ -858,6 +1414,26 @@ struct Bridge {
 impl Bridge {
     fn start(tmux: &Tmux) -> Self {
         Self::start_command(tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge")))
+    }
+
+    fn start_with_input(tmux: &Tmux) -> Self {
+        let mut command = tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge"));
+        command.arg(ENABLE_PANE_INPUT);
+        Self::start_command(command)
+    }
+
+    fn start_with_tmux_wrapper(tmux: &Tmux, args: &[&str], script: &str) -> Self {
+        let wrapper = tmux.dir.join("tmux");
+        fs::write(&wrapper, script).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(tmux.dir.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut command = tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge"));
+        command.args(args).env("PATH", path);
+        Self::start_command(command)
     }
 
     fn start_command(mut command: Command) -> Self {
@@ -930,6 +1506,21 @@ impl Bridge {
         self.request(
             "POST",
             READ_PANE,
+            &format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n{headers}",
+                body.len()
+            ),
+            &body,
+        )
+    }
+
+    fn send_input(&self, target: &Value, input: Value, headers: &str) -> (u16, String) {
+        let mut body = target.clone();
+        body["input"] = input;
+        let body = body.to_string();
+        self.request(
+            "POST",
+            SEND_INPUT,
             &format!(
                 "Content-Type: application/json\r\nContent-Length: {}\r\n{headers}",
                 body.len()

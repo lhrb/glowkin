@@ -16,6 +16,9 @@ struct Args {
     bind: String,
     #[arg(long, default_value = "8787")]
     port: NonZeroU16,
+    /// Allow reachable peers to type into eligible panes.
+    #[arg(long)]
+    enable_pane_input: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -26,10 +29,16 @@ async fn main() -> io::Result<()> {
         Any reachable peer can read eligible pane contents. \
         Never expose publicly; restrict peers with firewall/Tailscale policy."
     );
+    if args.enable_pane_input {
+        eprintln!(
+            "WARNING: pane input is enabled. Any reachable peer can type into eligible panes \
+            and potentially execute commands as the pane's user."
+        );
+    }
     let listener = TcpListener::bind((args.bind.as_str(), args.port.get())).await?;
     println!("Bridge listening on {}", listener.local_addr()?);
     tokio::select! {
         result = tokio::signal::ctrl_c() => result,
-        result = features::connection::serve(listener) => result,
+        result = features::connection::serve(listener, args.enable_pane_input) => result,
     }
 }

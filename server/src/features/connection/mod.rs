@@ -7,9 +7,9 @@ mod domain;
 #[path = "adapters/inbound/http.rs"]
 mod http;
 
-pub(crate) async fn serve(listener: TcpListener) -> io::Result<()> {
+pub(crate) async fn serve(listener: TcpListener, enable_pane_input: bool) -> io::Result<()> {
     let snapshot = domain::Snapshot {
         revision: Uuid::new_v4().simple().to_string(),
     };
-    http::serve(listener, snapshot).await
+    http::serve(listener, snapshot, enable_pane_input).await
 }
