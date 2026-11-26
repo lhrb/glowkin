@@ -3,16 +3,19 @@ package dev.lhrb.app.glowkin
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -29,10 +32,15 @@ class MainActivity : ComponentActivity() {
     private var openingShell by mutableStateOf(false)
     private var preview by mutableStateOf(PanePreview())
     private var previewProtected = false
+    private var paneName by mutableStateOf<String?>(null)
+    private var recovering by mutableStateOf(true)
+    private var connectionRequested by mutableStateOf(false)
+    private var reconnectRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        connectionRequested = savedInstanceState?.getBoolean("connectionRequested") == true
         connection = ConnectionModule(applicationContext) { current, error, opening, pane ->
             if (pane.text?.isNotBlank() == true && !previewProtected) {
                 // Keep protection until destruction so a frame with old pixels cannot be saved.
@@ -43,14 +51,93 @@ class MainActivity : ComponentActivity() {
             storageError = error
             openingShell = opening
             preview = pane
-        }
-        setContent {
-            GlowkinTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { padding ->
-                    ConnectionScreen(state, storageError, openingShell, preview, connection, Modifier.padding(padding))
+            when {
+                current.status == ConnectionStatus.CONNECTED -> {
+                    recovering = false
+                    if (reconnectRequested) closeConnectionPage()
+                }
+                current.error != null -> {
+                    recovering = true
+                    if (paneName != null) leaveDetail()
                 }
             }
         }
+        setContent {
+            GlowkinTheme {
+                // Keep overview position while its composition is replaced by another page.
+                val listState = rememberLazyListState()
+                val showConnection = recovering || connectionRequested
+                val canCloseConnection = connectionRequested && !recovering && state.status == ConnectionStatus.CONNECTED
+                val selectedName = paneName
+                val returnToOverview = {
+                    if (paneName != null) leaveDetail() else closeConnectionPage()
+                }
+                BackHandler(enabled = selectedName != null || canCloseConnection, onBack = returnToOverview)
+                Scaffold(
+                    modifier = Modifier.fillMaxSize().imePadding(),
+                    bottomBar = {
+                        WorkspaceBar(
+                            state,
+                            canShowOverview = !showConnection || canCloseConnection,
+                            onOverview = returnToOverview,
+                            onConnection = {
+                                if (!showConnection) {
+                                    if (paneName != null) leaveDetail()
+                                    connectionRequested = true
+                                }
+                            },
+                        )
+                    },
+                ) { padding ->
+                    val modifier = Modifier.padding(padding).consumeWindowInsets(padding)
+                    when {
+                        showConnection -> ConnectionScreen(
+                            state, storageError, openingShell,
+                            onReplace = { host, port ->
+                                connection.replace(host, port)
+                                reconnectRequested = true
+                            },
+                            onRetry = {
+                                reconnectRequested = true
+                                connection.retry()
+                            },
+                            onDisconnect = {
+                                reconnectRequested = false
+                                recovering = true
+                                connection.disconnect()
+                            },
+                            modifier = modifier,
+                        )
+                        selectedName != null -> PaneDetail(selectedName, preview, modifier)
+                        else -> SessionOverview(
+                            state, openingShell, listState,
+                            onRefresh = connection::retry,
+                            onOpenShell = { connection.openShell(state) },
+                            onSelectPane = { window, target ->
+                                if (connection.selectPane(state, target)) paneName = window.name
+                            },
+                            modifier = modifier,
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun closeConnectionPage() {
+        connectionRequested = false
+        reconnectRequested = false
+    }
+
+    private fun leaveDetail() {
+        connection.clearPane()
+        preview = PanePreview()
+        paneName = null
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean("connectionRequested", connectionRequested)
     }
 
     override fun onStart() { super.onStart(); connection.start() }
@@ -59,7 +146,58 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun ConnectionScreen(state: ConnectionState, storageError: String?, openingShell: Boolean, preview: PanePreview, connection: ConnectionModule, modifier: Modifier) {
+private fun WorkspaceBar(
+    state: ConnectionState,
+    canShowOverview: Boolean,
+    onOverview: () -> Unit,
+    onConnection: () -> Unit,
+) {
+    val windowCount = if (state.status == ConnectionStatus.CONNECTED && !state.stale) {
+        (state.snapshot?.workspace as? Workspace.Ready)?.windows?.size
+    } else null
+    val countLabel = when (windowCount) {
+        null -> "Window count unavailable"
+        1 -> "1 window"
+        else -> "$windowCount windows"
+    }
+    val connectionLabel = when (state.status) {
+        ConnectionStatus.CONNECTING -> "Connecting…"
+        ConnectionStatus.CONNECTED -> "Connected"
+        ConnectionStatus.DISCONNECTED -> "Disconnected"
+    }
+    Surface(tonalElevation = 3.dp) {
+        Row(
+            Modifier.fillMaxWidth().windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom),
+            ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = onOverview, modifier = Modifier.weight(1f), enabled = canShowOverview) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Overview")
+                    Text(countLabel, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            TextButton(onClick = onConnection, modifier = Modifier.weight(1f)) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("Connection")
+                    Text(connectionLabel, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectionScreen(
+    state: ConnectionState,
+    storageError: String?,
+    openingShell: Boolean,
+    onReplace: (String, Int) -> Unit,
+    onRetry: () -> Unit,
+    onDisconnect: () -> Unit,
+    modifier: Modifier,
+) {
     var host by rememberSaveable { mutableStateOf("") }
     var port by rememberSaveable { mutableStateOf("8787") }
     var inputError by rememberSaveable { mutableStateOf<String?>(null) }
@@ -68,92 +206,50 @@ private fun ConnectionScreen(state: ConnectionState, storageError: String?, open
     }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("PC bridge", style = MaterialTheme.typography.headlineMedium)
-        Text(when (state.status) {
-            ConnectionStatus.CONNECTING -> "Connecting…"
-            ConnectionStatus.CONNECTED -> "Connected"
-            ConnectionStatus.DISCONNECTED -> "Disconnected"
-        }, style = MaterialTheme.typography.titleLarge)
         state.endpoint?.let { Text("Saved endpoint: ${it.host} · port ${it.port}") }
-        OutlinedTextField(host, { host = it; inputError = null }, label = { Text("Hostname or IP address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(port, { port = it; inputError = null }, label = { Text("Port") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
-        Button(onClick = {
-            try {
-                connection.replace(host, port.toIntOrNull() ?: throw InvalidEndpoint())
-                inputError = null
-            } catch (failure: InvalidEndpoint) { inputError = failure.message }
-        }) { Text(if (state.endpoint == null) "Save and connect" else "Replace and connect") }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = connection::retry, enabled = state.endpoint != null && !openingShell) { Text("Retry") }
-            OutlinedButton(onClick = connection::disconnect, enabled = state.endpoint != null) { Text("Disconnect") }
-        }
         val error = inputError ?: storageError ?: when (state.error) {
             ConnectionError.UNREACHABLE -> "Cannot reach the bridge. Check its address and port, PC server, firewall, and WLAN or Tailscale connection; then retry."
             ConnectionError.PROTOCOL -> "This endpoint is not a compatible v1 bridge. Check the port and update or restart the PC bridge; then retry."
             null -> null
         }
         error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        if (state.changeOutcome == ChangeOutcome.UNCERTAIN) {
+            Text("Open shell may have succeeded. Check the PC windows before trying again.")
+        }
+        OutlinedTextField(host, { host = it; inputError = null }, label = { Text("Hostname or IP address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(port, { port = it; inputError = null }, label = { Text("Port") }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+        Button(onClick = {
+            try {
+                onReplace(host, port.toIntOrNull() ?: throw InvalidEndpoint())
+                inputError = null
+            } catch (failure: InvalidEndpoint) { inputError = failure.message }
+        }) { Text(if (state.endpoint == null) "Save and connect" else "Replace and connect") }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = onRetry, enabled = state.endpoint != null && !openingShell) { Text("Retry") }
+            OutlinedButton(onClick = onDisconnect, enabled = state.endpoint != null) { Text("Disconnect") }
+        }
         state.snapshot?.let {
             Text(if (state.stale) "Stale snapshot — not current PC state" else "Current bridge snapshot")
             Text("Bridge revision: ${it.revision}")
         }
-        if (state.snapshot != null) WorkspaceSection(state, openingShell, preview, connection)
         Text("Disconnection does not stop PC work or confirm whether a command succeeded.")
         Text("Unauthenticated HTTP PC control: use trusted networks only. Any reachable peer can read eligible panes on bridges that support pane reading. WLAN alone does not authorize peers. Restrict access with firewall or Tailscale policy; never expose publicly.")
     }
 }
 
 @Composable
-private fun WorkspaceSection(state: ConnectionState, openingShell: Boolean, preview: PanePreview, connection: ConnectionModule) {
-    Text("tmux workspace", style = MaterialTheme.typography.titleLarge)
-    val workspace = state.snapshot?.workspace
-    if (workspace != null) {
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = connection::retry, enabled = !openingShell) { Text("Refresh") }
-            if (workspace is Workspace.Ready) {
-                Button(onClick = { connection.openShell(state) }, enabled = !openingShell && state.shellTarget != null) {
-                    Text("Open shell")
-                }
-            }
+private fun PaneDetail(name: String, preview: PanePreview, modifier: Modifier) {
+    Column(modifier.fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(name, style = MaterialTheme.typography.headlineMedium)
+        Text("Read-only pane", style = MaterialTheme.typography.titleSmall)
+        val text = preview.text
+        when {
+            preview.error != null -> Text(preview.error)
+            text == null -> Text("Reading pane…")
+            text.isBlank() -> Text("Pane is blank.")
+            else -> Text(text, fontFamily = FontFamily.Monospace, softWrap = false,
+                modifier = Modifier.fillMaxWidth().weight(1f)
+                    .verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()))
         }
-    }
-    val feedback = when (state.changeOutcome) {
-        ChangeOutcome.APPLIED -> "Shell window opened."
-        ChangeOutcome.TARGET_UNAVAILABLE -> "Could not open a shell: the listed tmux session is no longer available."
-        ChangeOutcome.REJECTED -> "The bridge rejected Open shell. Check the bridge version and settings."
-        ChangeOutcome.UNCERTAIN -> "Open shell may have succeeded. Check the PC windows before trying again."
-        else -> null
-    }
-    feedback?.let { Text(it) }
-    when (workspace) {
-        is Workspace.Ready -> {
-            Text("Session: ${workspace.name}")
-            workspace.windows.forEach { window ->
-                val target = state.paneTarget(window)
-                if (target == null) {
-                    Text(window.name)
-                } else {
-                    TextButton(onClick = { connection.selectPane(state, target) }) { Text(window.name) }
-                    if (preview.target == target) PanePreviewPanel(preview)
-                }
-            }
-        }
-        Workspace.NoSession -> Text("Start a tmux session on the PC to see its windows here.")
-        Workspace.MultipleSessions -> Text("Glowkin supports one tmux session at a time. Manage sessions on the PC.")
-        Workspace.Unavailable -> Text("Cannot read tmux. Check that tmux and a session are running on the PC.")
-        null -> Text("This bridge does not report tmux windows. Update the bridge to use workspace controls.")
-    }
-    if (preview.target == null) preview.error?.let { Text(it) }
-}
-
-@Composable
-private fun PanePreviewPanel(preview: PanePreview) {
-    Text("Selected pane", style = MaterialTheme.typography.titleSmall)
-    val text = preview.text
-    when {
-        preview.error != null -> Text(preview.error)
-        text == null -> Text("Reading pane…")
-        text.isBlank() -> Text("Pane is blank.")
-        else -> Text(text, fontFamily = FontFamily.Monospace, softWrap = false,
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()))
     }
 }

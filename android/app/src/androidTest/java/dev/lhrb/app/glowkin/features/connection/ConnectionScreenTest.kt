@@ -19,41 +19,76 @@ import java.util.concurrent.atomic.AtomicReference
 class ConnectionScreenTest {
     @get:Rule val compose = createEmptyComposeRule()
 
-    @Test fun savedEndpointConnectsDisconnectsAndRefreshesAfterRecreation() {
+    @Test fun savedEndpointReconnectsToAnOverviewForAnOlderBridge() = withApp { server, scenario ->
+        connect(server)
+        awaitText("Session overview")
+        awaitText("This bridge does not report tmux windows. Update the bridge to use workspace controls.")
+        compose.onNodeWithText("Connected").assertIsDisplayed()
+        compose.onNodeWithText("Window count unavailable").assertIsDisplayed()
+        compose.onNodeWithText("0 windows").assertDoesNotExist()
+        compose.onNodeWithText("Bridge revision: first").assertDoesNotExist()
+        compose.onNodeWithText("Open shell").assertDoesNotExist()
+        compose.onNodeWithText("Hostname or IP address").assertDoesNotExist()
+
+        server.revision.set("after-recreation")
+        scenario.recreate()
+        awaitText("Session overview")
+        click("Connection")
+        awaitText("Connected")
+        awaitText("Bridge revision: after-recreation")
+        compose.onNodeWithText("Saved endpoint: 127.0.0.1 · port ${server.port}").assertExists()
+        compose.onNode(hasSetTextAction() and hasText("Hostname or IP address")).assertTextContains("127.0.0.1")
+        compose.onNode(hasSetTextAction() and hasText("Port")).assertTextContains(server.port.toString())
+
+        click("Overview")
+        awaitText("Session overview")
+        click("Connection")
+        click("Disconnect")
+        awaitText("Disconnected")
+        compose.onNodeWithText("Overview").assertIsNotEnabled()
+        awaitText("Stale snapshot — not current PC state")
+        compose.onNodeWithText("Bridge revision: after-recreation").assertExists()
+    }
+
+    @Test fun connectionShowsFailuresAndStaysOpenThroughAutomaticRecovery() = withApp { server, scenario ->
+        server.failing = true
+        connect(server)
+        awaitFailure()
+        server.failing = false
+        awaitText("Session overview")
+        click("Connection")
+        awaitText("Connected")
+
+        server.failing = true
+        awaitFailure()
+        server.failing = false
+        awaitText("Connected")
+        compose.onNodeWithText("Session overview").assertDoesNotExist()
+        scenario.recreate()
+        awaitText("Connected")
+        compose.onNodeWithText("Session overview").assertDoesNotExist()
+
+        click("Retry")
+        awaitText("Session overview")
+    }
+
+    private fun awaitFailure() = awaitText("This endpoint is not a compatible v1 bridge. Check the port and update or restart the PC bridge; then retry.")
+
+    private fun connect(server: SnapshotServer) {
+        compose.onNode(hasSetTextAction() and hasText("Hostname or IP address")).performTextReplacement("127.0.0.1")
+        compose.onNode(hasSetTextAction() and hasText("Port")).performTextReplacement(server.port.toString())
+        click("Save and connect")
+    }
+
+    private fun click(text: String) = compose.onNodeWithText(text).performClick()
+
+    private fun withApp(block: (SnapshotServer, ActivityScenario<MainActivity>) -> Unit) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
         assertTrue(preferences.edit().clear().commit())
         try {
             SnapshotServer().use { server ->
-                ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-                    compose.onNode(hasSetTextAction() and hasText("Hostname or IP address"))
-                        .performTextReplacement("127.0.0.1")
-                    compose.onNode(hasSetTextAction() and hasText("Port"))
-                        .performTextReplacement(server.port.toString())
-                    compose.onNodeWithText("Save and connect").performScrollTo().performClick()
-                    awaitText("Connected")
-                    awaitText("Bridge revision: first")
-                    val savedEndpoint = "Saved endpoint: 127.0.0.1 · port ${server.port}"
-                    compose.onNodeWithText(savedEndpoint).assertExists()
-
-                    compose.onNodeWithText("Disconnect").performScrollTo().performClick()
-                    awaitText("Disconnected")
-                    awaitText("Stale snapshot — not current PC state")
-                    compose.onNodeWithText("Bridge revision: first").assertExists()
-
-                    server.revision.set("after-recreation")
-                    scenario.recreate()
-
-                    awaitText("Connected")
-                    awaitText("Bridge revision: after-recreation")
-                    compose.onNodeWithText(savedEndpoint).assertExists()
-                    compose.onNode(hasSetTextAction() and hasText("Hostname or IP address"))
-                        .assertTextContains("127.0.0.1")
-                    compose.onNode(hasSetTextAction() and hasText("Port"))
-                        .assertTextContains(server.port.toString())
-                    compose.onNodeWithText("Current bridge snapshot").assertExists()
-                    compose.onNodeWithText("Stale snapshot — not current PC state").assertDoesNotExist()
-                }
+                ActivityScenario.launch(MainActivity::class.java).use { scenario -> block(server, scenario) }
             }
         } finally {
             assertTrue(preferences.edit().clear().commit())
@@ -68,6 +103,7 @@ class ConnectionScreenTest {
 
     private class SnapshotServer : AutoCloseable {
         val revision = AtomicReference("first")
+        @Volatile var failing = false
         private val server = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
         val port: Int get() = server.localPort
         private val executor = Executors.newSingleThreadExecutor()
@@ -80,7 +116,7 @@ class ConnectionScreenTest {
                         val request = reader.readLine()
                         while (!reader.readLine().isNullOrEmpty()) { }
                         check(request == "GET /v1/connection/snapshot HTTP/1.1") { "Unexpected request: $request" }
-                        val body = """{"protocolVersion":1,"revision":"${revision.get()}"}""".toByteArray()
+                        val body = """{"protocolVersion":${if (failing) 2 else 1},"revision":"${revision.get()}"}""".toByteArray()
                         client.getOutputStream().apply {
                             write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" +
                                 "Content-Length: ${body.size}\r\nConnection: close\r\n\r\n").toByteArray())

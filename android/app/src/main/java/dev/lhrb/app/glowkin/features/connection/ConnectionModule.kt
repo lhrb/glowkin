@@ -78,11 +78,17 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         }
     }
 
-    fun selectPane(shown: ConnectionState, target: PaneTarget) {
-        if (!foreground || !wanted || !shown.canRead(target)) return
+    fun selectPane(shown: ConnectionState, target: PaneTarget): Boolean {
+        if (!foreground || !wanted || !shown.canRead(target)) return false
         selection = Selection(target)
         preview = PanePreview(target)
         render(shown, null, openingShell, preview)
+        return true
+    }
+
+    fun clearPane() {
+        selection = null
+        preview = PanePreview()
     }
 
     fun openShell(shown: ConnectionState) {
@@ -116,8 +122,7 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
         openingShell = false
         polling?.cancel(false)
         polling = null
-        if (forgetPane) selection = null
-        preview = PanePreview(selection?.target)
+        if (forgetPane) clearPane() else preview = PanePreview(selection?.target)
         useCase?.let {
             it.disconnect() // No I/O; invalidates even a currently blocked HTTP response.
             render(it.state, null, false, preview)
@@ -151,7 +156,7 @@ class ConnectionModule(context: Context, private val render: (ConnectionState, S
     private fun readPreview(token: Long, state: ConnectionState) {
         val chosen = selection ?: return
         val endpoint = state.endpoint ?: return
-        if (token != epoch || !state.canRead(chosen.target)) return
+        if (!state.canRead(chosen.target) || token != epoch || selection !== chosen) return
         val result = transport.readPane(endpoint, chosen.target)
         main.post {
             if (token != epoch || !foreground || selection !== chosen) return@post

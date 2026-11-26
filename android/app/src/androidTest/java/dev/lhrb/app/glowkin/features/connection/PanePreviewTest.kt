@@ -24,7 +24,9 @@ class PanePreviewTest {
     @Test fun reselectionDiscardsDelayedResponseEvenForTheSamePane() = withApp { server, _ ->
         click("Pane A")
         val old = server.nextRead("%1")
+        click("Overview")
         click("Pane B")
+        click("Overview")
         click("Pane A")
         old.reply("obsolete A")
 
@@ -33,6 +35,7 @@ class PanePreviewTest {
         fresh.reply("fresh A\n    indented\n")
         awaitText("fresh A\n    indented\n")
 
+        click("Overview")
         click("Pane B")
         compose.onNodeWithText("fresh A", substring = true).assertDoesNotExist()
         server.nextRead("%2").reply("current B")
@@ -42,8 +45,11 @@ class PanePreviewTest {
         compose.waitUntil(timeoutMillis = 8_000) {
             compose.onAllNodesWithText("current B").fetchSemanticsNodes().isEmpty()
         }
-        compose.onNodeWithText("Pane B").assertHasNoClickAction()
+        awaitText("Pane is no longer available. Select a window again.")
         assertNull("ineligible selection must stop reading", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        compose.onNodeWithText("2 windows").assertIsDisplayed()
+        click("Overview")
+        compose.onNodeWithText("Pane B").assertHasNoClickAction()
     }
 
     @Test fun stopsReadsInBackgroundAndDropsThePreviousForegroundsDelivery() = withApp { server, activity ->
@@ -58,13 +64,71 @@ class PanePreviewTest {
         compose.onNodeWithText("previous foreground").assertDoesNotExist()
         current.reply("current foreground")
         awaitText("current foreground")
+    }
 
+    @Test fun backReturnsToOverviewAndDiscardsAnInFlightRead() = withApp { server, activity ->
+        click("Pane A")
+        server.nextRead("%1").reply("detail content")
+        awaitText("detail content")
+        compose.onNodeWithText("Pane B").assertDoesNotExist()
         val delayed = server.nextRead("%1")
-        click("Disconnect")
-        compose.onNodeWithText("current foreground").assertDoesNotExist()
-        delayed.reply("after disconnect")
-        assertNull("disconnect must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
-        compose.onNodeWithText("after disconnect").assertDoesNotExist()
+        compose.waitForIdle()
+        back(activity)
+        delayed.reply("after Back")
+        awaitText("Pane B")
+        compose.onNodeWithText("detail content").assertDoesNotExist()
+        assertNull("Back must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        compose.onNodeWithText("after Back").assertDoesNotExist()
+    }
+
+    @Test fun bottomOverviewDiscardsAnInFlightRead() = withApp { server, _ ->
+        click("Pane A")
+        server.nextRead("%1").reply("detail before overview")
+        awaitText("detail before overview")
+        val delayed = server.nextRead("%1")
+        click("Overview")
+        delayed.reply("late after overview")
+        awaitText("Pane B")
+        compose.onNodeWithText("detail before overview").assertDoesNotExist()
+        assertNull("bottom overview must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        compose.onNodeWithText("late after overview").assertDoesNotExist()
+    }
+
+    @Test fun connectionFromDetailClearsSelectionEvenWhenReturningWithBack() = withApp { server, activity ->
+        click("Pane A")
+        server.nextRead("%1").reply("detail before connection")
+        awaitText("detail before connection")
+        val delayed = server.nextRead("%1")
+        click("Connection")
+        delayed.reply("late after connection")
+        awaitText("PC bridge")
+        compose.onNodeWithText("detail before connection").assertDoesNotExist()
+        assertNull("connection page must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+
+        back(activity)
+        awaitText("Pane B")
+        compose.onNodeWithText("late after connection").assertDoesNotExist()
+        assertNull("leaving connection must not reopen detail", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+    }
+
+    @Test fun losingConnectionClearsPreviewAndRecoveryDoesNotReopenDetail() = withApp { server, _ ->
+        click("Pane A")
+        server.nextRead("%1").reply("before loss")
+        awaitText("before loss")
+        compose.onNodeWithText("2 windows").assertIsDisplayed()
+        server.failSnapshots = true
+        awaitText("Disconnected")
+        compose.onNodeWithText("before loss").assertDoesNotExist()
+        compose.onNodeWithText("2 windows").assertDoesNotExist()
+        compose.onNodeWithText("Window count unavailable").assertIsDisplayed()
+
+        server.failSnapshots = false
+        awaitText("Pane B")
+        compose.onNodeWithText("2 windows").assertIsDisplayed()
+        assertNull("recovery must not reopen the pane", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        click("Pane A")
+        server.nextRead("%1").reply("opened again")
+        awaitText("opened again")
     }
 
     private fun withApp(block: (PaneServer, ActivityScenario<MainActivity>) -> Unit) {
@@ -88,7 +152,11 @@ class PanePreviewTest {
         }
     }
 
-    private fun click(text: String) = compose.onNodeWithText(text).performScrollTo().performClick()
+    private fun click(text: String) = compose.onNodeWithText(text).performClick()
+
+    private fun back(activity: ActivityScenario<MainActivity>) = activity.onActivity {
+        it.onBackPressedDispatcher.onBackPressed()
+    }
 
     private fun awaitText(text: String) {
         compose.waitUntil(conditionDescription = "text '$text' is visible", timeoutMillis = 8_000) {
@@ -103,6 +171,7 @@ class PanePreviewTest {
 
     private class PaneServer : AutoCloseable {
         @Volatile var secondPane = true
+        @Volatile var failSnapshots = false
         val reads = LinkedBlockingQueue<Read>()
         private val listener = ServerSocket(0, 10, InetAddress.getByName("127.0.0.1"))
         val port: Int get() = listener.localPort
@@ -116,6 +185,7 @@ class PanePreviewTest {
                         val request = input.readLine()
                         val headers = generateSequence { input.readLine()?.takeUnless(String::isEmpty) }
                             .associate { it.substringBefore(':').lowercase() to it.substringAfter(':').trim() }
+                        val status = if (request.startsWith("GET ") && failSnapshots) "503 Unavailable" else "200 OK"
                         val (type, text) = when (request) {
                             "GET /v1/connection/snapshot HTTP/1.1" -> "application/json" to snapshot()
                             "POST /v1/workspace/read-pane HTTP/1.1" -> {
@@ -130,7 +200,7 @@ class PanePreviewTest {
                         }
                         val bytes = text.toByteArray()
                         client.getOutputStream().apply {
-                            write(("HTTP/1.1 200 OK\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\n" +
+                            write(("HTTP/1.1 $status\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\n" +
                                 "Cache-Control: no-store\r\nConnection: close\r\n\r\n").toByteArray())
                             write(bytes)
                         }

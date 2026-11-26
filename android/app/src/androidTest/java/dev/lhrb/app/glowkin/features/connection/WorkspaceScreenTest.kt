@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.test.core.app.ActivityScenario
+import androidx.test.espresso.Espresso.pressBack
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.lhrb.app.glowkin.MainActivity
 import org.json.JSONObject
@@ -23,12 +24,107 @@ import java.util.concurrent.atomic.AtomicInteger
 class WorkspaceScreenTest {
     @get:Rule val compose = createEmptyComposeRule()
 
-    @Test fun lostOpenResponseIsNotReplayedAndManualRetryUsesReconciledSession() {
+    @Test fun lostOpenResponseIsNotReplayedAndManualRetryUsesReconciledSession() = withApp { server ->
+        compose.onNodeWithText("Connection").assertHasClickAction()
+        compose.onNodeWithText("Session: work").assertIsDisplayed()
+        compose.onNodeWithText("Preexisting editor").assertHasNoClickAction()
+        compose.onNodeWithText("No readable pane reported for this window.").assertIsDisplayed()
+        compose.onNodeWithText("Hostname or IP address").assertDoesNotExist()
+        compose.onNodeWithText("Bridge revision:", substring = true).assertDoesNotExist()
+
+        server.pcWindow = true
+        click("Refresh")
+        awaitWindow("PC terminal")
+
+        click("Open shell")
+        compose.waitUntil(timeoutMillis = 10_000) { server.failedReads.get() > 0 }
+        assertEquals(listOf(Target("\$0", "first-generation")), server.opens.toList())
+
+        val uncertainFeedback = compose.onNodeWithText(
+            "Open shell may have succeeded. Check the PC windows before trying again.",
+        )
+        val readsBefore = server.failedReads.get()
+        compose.waitUntil(timeoutMillis = 10_000) { server.failedReads.get() > readsBefore }
+        uncertainFeedback.performScrollTo().assertIsDisplayed()
+        compose.onNode(hasText("Open shell") and isEnabled()).assertDoesNotExist()
+        assertEquals("no POST before reconciliation", 1, server.opens.size)
+
+        server.reachable = true
+        awaitWindow("Recovered terminal")
+        uncertainFeedback.assertIsDisplayed()
+        assertEquals("reconciliation must not replay POST", 1, server.opens.size)
+        click("Open shell")
+        awaitWindow("Manually opened terminal")
+        compose.onNodeWithText("Shell window opened.").assertIsDisplayed()
+        assertEquals(
+            listOf(Target("\$0", "first-generation"), Target("\$1", "recovered-generation")),
+            server.opens.toList(),
+        )
+    }
+
+    @Test fun windowCountTracksCurrentInventoryIncludingUnreadableWindows() = withApp { server ->
+        awaitWindow("1 window")
+        server.pcWindow = true
+        click("Refresh")
+        awaitWindow("2 windows")
+        server.pcWindow = false
+        click("Refresh")
+        awaitWindow("1 window")
+        server.empty = true
+        click("Refresh")
+        awaitWindow("0 windows")
+        compose.onNodeWithText("No windows reported for this session.").assertIsDisplayed()
+    }
+
+    @Test fun bottomEntriesStayReachableWithoutCoveringTheLastRowOrPane() = withApp(longList = true) {
+        val overview = compose.onNodeWithText("Overview")
+        val connection = compose.onNodeWithText("Connection")
+        val barTop = connection.getUnclippedBoundsInRoot().top
+        val list = compose.onNode(hasScrollToIndexAction())
+        val last = compose.onNodeWithText("Window after 24")
+        list.performScrollToIndex(49)
+        last.assertIsDisplayed()
+        assertTrue(last.getUnclippedBoundsInRoot().bottom < barTop)
+        connection.assertIsDisplayed()
+        overview.assertIsDisplayed()
+        assertEquals(barTop, connection.getUnclippedBoundsInRoot().top)
+
+        val window = compose.onNodeWithText("Readable work")
+        list.performScrollToNode(hasText("Readable work"))
+        val top = window.getUnclippedBoundsInRoot().top
+        window.performClick()
+        awaitWindow("Current pane contents")
+        assertTrue(compose.onNodeWithText("Current pane contents").getUnclippedBoundsInRoot().bottom <= barTop)
+        overview.performClick()
+        window.assertIsDisplayed()
+        assertEquals(top, window.getUnclippedBoundsInRoot().top)
+    }
+
+    @Test fun backFromWindowDetailRestoresScrollPosition() = withApp(longList = true) {
+        val windowName = "Readable work"
+        val window = compose.onNodeWithText(windowName)
+        compose.onNode(hasScrollToIndexAction()).performScrollToNode(hasText(windowName))
+        window.assertIsDisplayed()
+        val top = window.getUnclippedBoundsInRoot().top
+
+        window.performClick()
+        awaitWindow("Current pane contents")
+        compose.onNodeWithText(windowName).assertIsDisplayed()
+        compose.onNodeWithText("Session overview").assertDoesNotExist()
+
+        pressBack()
+        compose.onNodeWithText("Session overview").assertIsDisplayed()
+        compose.onNodeWithText("Current pane contents").assertDoesNotExist()
+        window.assertIsDisplayed()
+        assertEquals(top, window.getUnclippedBoundsInRoot().top)
+    }
+
+    private fun withApp(longList: Boolean = false, block: (WorkspaceServer) -> Unit) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
         assertTrue(preferences.edit().clear().commit())
         try {
-            WorkspaceServer().use { server ->
+            WorkspaceServer(longList).use { server ->
                 ActivityScenario.launch(MainActivity::class.java).use {
                     compose.onNode(hasSetTextAction() and hasText("Hostname or IP address"))
                         .performTextReplacement("127.0.0.1")
@@ -36,33 +132,7 @@ class WorkspaceScreenTest {
                         .performTextReplacement(server.port.toString())
                     click("Save and connect")
                     awaitWindow("Preexisting editor")
-
-                    server.pcWindow = true
-                    click("Refresh")
-                    awaitWindow("PC terminal")
-
-                    click("Open shell")
-                    compose.waitUntil(timeoutMillis = 10_000) { server.failedReads.get() > 0 }
-                    assertEquals(listOf(Target("\$0", "first-generation")), server.opens.toList())
-
-                    // A visible and enabled action may request a refresh, but cannot send a stale POST.
-                    val enabledOpen = hasText("Open shell") and hasClickAction() and isEnabled()
-                    val readsBefore = server.failedReads.get()
-                    if (compose.onAllNodes(enabledOpen).fetchSemanticsNodes().isNotEmpty()) {
-                        compose.onNode(enabledOpen).performScrollTo().performClick()
-                    }
-                    compose.waitUntil(timeoutMillis = 10_000) { server.failedReads.get() > readsBefore }
-                    assertEquals("no POST before reconciliation", 1, server.opens.size)
-
-                    server.reachable = true
-                    awaitWindow("Recovered terminal")
-                    assertEquals("reconciliation must not replay POST", 1, server.opens.size)
-                    click("Open shell")
-                    awaitWindow("Manually opened terminal")
-                    assertEquals(
-                        listOf(Target("\$0", "first-generation"), Target("\$1", "recovered-generation")),
-                        server.opens.toList(),
-                    )
+                    block(server)
                 }
             }
         } finally {
@@ -80,8 +150,9 @@ class WorkspaceScreenTest {
 
     private data class Target(val sessionId: String, val generation: String)
 
-    private class WorkspaceServer : AutoCloseable {
+    private class WorkspaceServer(private val longList: Boolean) : AutoCloseable {
         @Volatile var pcWindow = false
+        @Volatile var empty = false
         @Volatile var reachable = true
         val failedReads = AtomicInteger()
         val opens = CopyOnWriteArrayList<Target>()
@@ -101,6 +172,7 @@ class WorkspaceScreenTest {
                                 put(line.substringBefore(':').lowercase(), line.substringAfter(':').trim())
                             }
                         }
+                        val contentType = if (request == "POST /v1/workspace/read-pane HTTP/1.1") "text/plain" else "application/json"
                         val (status, body) = when (request) {
                             "GET /v1/connection/snapshot HTTP/1.1" -> if (reachable) {
                                 "200 OK" to snapshot()
@@ -121,11 +193,18 @@ class WorkspaceScreenTest {
                                 }
                                 "204 No Content" to ""
                             }
+                            "POST /v1/workspace/read-pane HTTP/1.1" -> {
+                                val json = JSONObject(reader.readBody(headers))
+                                check(longList && json.getString("sessionId") == "\$0" &&
+                                    json.getString("generation") == "first-generation" &&
+                                    json.getString("windowId") == "@25" && json.getString("paneId") == "%25")
+                                "200 OK" to "Current pane contents"
+                            }
                             else -> error("Unexpected request: $request")
                         }
                         val payload = body.toByteArray()
                         client.getOutputStream().apply {
-                            write(("HTTP/1.1 $status\r\nContent-Type: application/json\r\n" +
+                            write(("HTTP/1.1 $status\r\nContent-Type: $contentType\r\n" +
                                 "Content-Length: ${payload.size}\r\nConnection: close\r\n\r\n").toByteArray())
                             write(payload)
                             flush()
@@ -140,8 +219,13 @@ class WorkspaceScreenTest {
         private fun snapshot(): String {
             val (id, generation, windows) = if (opens.isEmpty()) {
                 Triple("\$0", "first-generation", buildList {
-                    add("Preexisting editor")
+                    if (!empty) add("Preexisting editor")
                     if (pcWindow) add("PC terminal")
+                    if (longList) {
+                        repeat(24) { add("Window before ${it + 1}") }
+                        add("Readable work")
+                        repeat(24) { add("Window after ${it + 1}") }
+                    }
                 })
             } else {
                 Triple("\$1", "recovered-generation", buildList {
@@ -149,7 +233,10 @@ class WorkspaceScreenTest {
                     if (opens.size > 1) add("Manually opened terminal")
                 })
             }
-            val inventory = windows.mapIndexed { index, name -> """{"id":"@$index","name":"$name"}""" }
+            val inventory = windows.mapIndexed { index, name ->
+                val pane = if (name == "Readable work") ",\"paneId\":\"%25\"" else ""
+                """{"id":"@$index","name":"$name"$pane}"""
+            }
             return """{"protocolVersion":1,"revision":"bridge","workspace":{"status":"ready",
                 "session":{"id":"$id","name":"work","generation":"$generation",
                 "windows":[${inventory.joinToString()}]}}}"""
