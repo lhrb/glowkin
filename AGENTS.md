@@ -7,6 +7,11 @@
 - Verify relevant behavior, report gaps, and stop at scope.
 - Be concise and use active voice. Give the answer, reason, then next step. Keep one idea per sentence.
 
+## tmux tests and probes
+
+- Use `tmp=$(mktemp -d)` and `tmux -S "$tmp/socket"` for every test command, including setup and cleanup. Never target live tmux or run bare `tmux kill-server`.
+- `TMUX_TMPDIR` alone is unsafe: inherited `$TMUX` can select the developer's live server.
+
 ## Languages
 
 - `android/`: Kotlin. Pi extensions: JS/TS.
