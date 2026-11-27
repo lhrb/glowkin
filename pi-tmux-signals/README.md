@@ -18,10 +18,12 @@ Opt in only one tmux server: every config that sources this file uses the same d
 
 Run plain `pi` in a pane and press `Ctrl+b w`. Each window shows its highest-priority state: `[permission]`, `[needs input]`, `[busy]`, `[done]` (finished normally, not necessarily successful), or `[idle]`. Windows without an observed Pi have no label.
 
+A `●` beside the label means an agent finished or started waiting when that window was not current on an attached terminal client. Opening the chooser or previewing a row keeps the dot. Selecting the window clears it without changing the label or answering a prompt. Starting new work, resolving a prompt, or disconnecting clears that agent’s old dot, not another agent’s. If the receiver stops, dots and labels expire within six seconds of its last update. Reopen an already open chooser to see the expiry.
+
 The permission adapter observes `@gotgenes/pi-permission-system` only if you already use it; the installer does not install that package. Remove any old manually loaded copies of the extensions to avoid duplicates.
 
 ## Verify
 
-From the repository root, run `bash pi-tmux-signals/tests/verify-startup.sh` (offline; requires Python 3).
+From the repository root, run `bash pi-tmux-signals/tests/verify-startup.sh` for the offline Pi chooser workflow. Run `bash pi-tmux-signals/tests/verify-unread.sh` for controlled unread transitions, short visits, and lease expiry. Both use private tmux servers and require Python 3.
 
 To also test permission prompts, run `bash pi-tmux-signals/tests/verify-capture.sh` with the permission package installed. Set `PI_PERMISSION_PACKAGE` to the installed package directory if you use a custom location.

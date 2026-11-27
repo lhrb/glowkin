@@ -1,3 +1,4 @@
+use crate::Source;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::Metadata;
@@ -11,11 +12,18 @@ const OPTION: &str = "@glowkin-pi-signals";
 const RENEW: Duration = Duration::from_secs(2);
 const LEASE_SECONDS: u64 = 6;
 
+#[derive(PartialEq)]
+struct PaneState {
+    instance: String,
+    label: &'static str,
+}
+
 pub(crate) struct Chooser {
     socket: PathBuf,
     generation: String,
     next_server_check: Option<Instant>,
-    states: HashMap<String, &'static str>,
+    states: HashMap<String, PaneState>,
+    pending: HashMap<String, bool>,
     next_refresh: Instant,
     failed: bool,
 }
@@ -34,25 +42,37 @@ impl Chooser {
             generation,
             next_server_check: expected.map(|_| Instant::now()),
             states: HashMap::new(),
+            pending: HashMap::new(),
             next_refresh: Instant::now(),
             failed: false,
         })
     }
 
-    pub(crate) fn observe(&mut self, pane: String, state: &'static str) {
-        let state = if state == "needs_permission" {
-            "permission"
+    pub(crate) fn observe(&mut self, source: Source, state: &'static str) {
+        let Source { pane, instance } = source;
+        if state == "gone" {
+            if self.states.remove(&pane).is_none() {
+                return;
+            }
         } else {
-            state
-        };
-        let changed = if state == "gone" {
-            self.states.remove(&pane).is_some()
-        } else {
-            self.states.insert(pane, state) != Some(state)
-        };
-        if changed {
-            self.refresh();
+            let next = PaneState {
+                instance,
+                label: if state == "needs_permission" {
+                    "permission"
+                } else {
+                    state
+                },
+            };
+            if self.states.get(&pane) == Some(&next) {
+                return;
+            }
+            self.states.insert(pane.clone(), next);
         }
+        self.pending.insert(
+            pane,
+            matches!(state, "done" | "needs_input" | "needs_permission"),
+        );
+        self.refresh();
     }
 
     pub(crate) fn is_current(&self) -> bool {
@@ -100,7 +120,10 @@ impl Chooser {
 
     pub(crate) fn refresh(&mut self) {
         match self.publish() {
-            Ok(()) => self.failed = false,
+            Ok(()) => {
+                self.pending.clear();
+                self.failed = false;
+            }
             Err(err) if !self.failed => {
                 eprintln!("could not update Pi chooser status: {err}");
                 self.failed = true;
@@ -121,9 +144,32 @@ impl Chooser {
             let mut snapshot = format!("{}|", epoch.as_secs() + LEASE_SECONDS);
             for (pane, state) in &self.states {
                 // Pane IDs and state names come from the receiver's validated frames.
-                snapshot.push_str(&format!("{pane}:{state}|"));
+                write!(snapshot, "{pane}:{}|", state.label)
+                    .expect("writing to a String cannot fail");
             }
-            format!("set-option -s {OPTION} '{snapshot}'")
+            // tmux owns acknowledgements. Preserve its live marker tail on renewal,
+            // but replace each changed pane's marker in the same format expansion.
+            snapshot.push_str("#{?#{E:@glowkin-pi-lease-live},#{s/^[^+]*//");
+            if !self.pending.is_empty() {
+                let changed = self
+                    .pending
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("|");
+                write!(snapshot, ";s/[+]({changed})_//").expect("writing to a String cannot fail");
+            }
+            write!(snapshot, ":{OPTION}}},}}").expect("writing to a String cannot fail");
+            for (pane, attention) in &self.pending {
+                if *attention {
+                    write!(
+                        snapshot,
+                        "#{{?#{{m:*+{pane}_*,#{{E:@glowkin-pi-viewed-panes}}}},,+{pane}_}}"
+                    )
+                    .expect("writing to a String cannot fail");
+                }
+            }
+            format!("set-option -sF {OPTION} '{snapshot}'")
         };
         self.update(&command)
     }

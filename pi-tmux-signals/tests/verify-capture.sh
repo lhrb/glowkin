@@ -12,7 +12,7 @@ receiver_pid=
 pids=()
 chooser_client=
 
-clean=(env -i PATH=/usr/bin:/bin SHELL=/bin/sh HOME="$root/home" XDG_RUNTIME_DIR="$root/runtime"
+clean=(env -i PATH=/usr/bin:/bin SHELL=/bin/sh HOME="$root/home" LANG=C.UTF-8 XDG_RUNTIME_DIR="$root/runtime"
   CAPTURE_ROOT="$root" CAPTURE_TMUX="$root/tmux" PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0)
 signal_socket=$root/runtime/signals.sock
 signals=$root/received
@@ -153,12 +153,16 @@ chooser_shows() {
   output=$(viewer capture-pane -p) || return 1
   observed=$(grep -m1 -E ': observed([* -]|$)' <<< "$output") || return 1
   plain_row=$(grep -m1 -E ': plain([* -]|$)' <<< "$output") || return 1
-  [[ $plain_row != *' ['* && $observed == *"$suffix" && ( -n $1 || $observed != *' ['* ) ]]
+  [[ $plain_row != *' ['* && $observed == *"$suffix" && ( -n $1 || $observed != *' ['* ) ]] || return 1
+  case ${2:-} in
+    unread) [[ $observed == *" ●$suffix" ]] ;;
+    seen) [[ $observed != *' ● '* ]] ;;
+  esac
 }
 expect_chooser() {
-  if ! wait_for chooser_shows "$1"; then
+  if ! wait_for chooser_shows "$@"; then
     viewer capture-pane -p >&2 || true
-    fail "Chooser did not show '${1:-no suffix}' on observed only."
+    fail "Chooser did not show '${1:-no suffix}' ${2:-} on observed only."
   fi
 }
 detach_chooser() {
@@ -276,10 +280,18 @@ await_state "$right" idle
 expect_chooser idle
 printf 'Killing a pane with generic attention removes its label without running shutdown hooks.\n'
 
+viewer send-keys q
+chooser_closed() { [[ $(client display-message -p -t '=capture:plain' '#{pane_in_mode}') == 0 ]]; }
+wait_for chooser_closed || fail 'Chooser did not close before testing a current-window prompt.'
+client select-window -t '=capture:observed'
 begin left
 ask left "$left"
 await_state "$left" needs_permission
-expect_chooser permission
+active_permission() { [[ $(client display-message -p -t "$left" '#{E:@glowkin-pi-chooser-suffix}') == '#[default] [permission]' ]]; }
+wait_for active_permission || fail 'Current window did not show permission without a dot.'
+client select-window -t '=capture:plain'
+viewer send-keys C-b w
+expect_chooser permission seen
 latest_is "$right" idle || fail 'Permission state leaked to the other pane.'
 expect_count "$right" needs_permission 0
 client send-keys -t "$left" y
@@ -296,7 +308,16 @@ expect_count "$left" needs_permission 1
 begin right
 ask right "$right"
 await_state "$right" needs_permission
-expect_chooser permission
+expect_chooser permission unread
+viewer send-keys Up Enter
+selected_observed() { [[ $(client list-clients -F '#{window_name}') == observed ]]; }
+wait_for selected_observed || fail 'Chooser did not select the window waiting on permission.'
+viewer send-keys C-b w
+expect_chooser permission seen
+viewer send-keys q
+client select-window -t '=capture:plain'
+viewer send-keys C-b w
+expect_chooser permission seen
 latest_is "$left" done || fail 'Right-pane prompt changed left-pane state.'
 client send-keys -t "$right" Escape
 mark_wait right 'decision user_denied'
@@ -307,12 +328,11 @@ expect_chooser busy
 release right
 end_run right "$right"
 expect_count "$right" needs_permission 1
-expect_chooser done
+expect_chooser done unread
 viewer send-keys Up Enter
-selected_observed() { [[ $(client list-clients -F '#{window_name}') == observed ]]; }
 wait_for selected_observed || fail 'Chooser navigation did not select the unchanged observed window.'
 detach_chooser
-printf 'Real approval and Escape update the open chooser; navigation still selects the original window.\n'
+printf 'Real permission is unread in a background window but not in the current window. Selection clears only the dot; Escape still resolves the prompt and completion creates a new dot.\n'
 
 begin left
 submit "$left" 'silent fixture-prompt-canary'

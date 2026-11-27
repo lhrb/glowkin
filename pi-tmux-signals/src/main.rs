@@ -210,7 +210,7 @@ fn receive(
                 stdout.flush()?;
             }
             if let Some(chooser) = &mut chooser {
-                chooser.observe(source.pane, state);
+                chooser.observe(source, state);
             }
         }
     }

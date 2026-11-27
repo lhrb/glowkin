@@ -15,7 +15,7 @@ configured=$default
 unconfigured=$root/unconfigured.sock
 config=$home/.tmux.conf
 pid=
-clean=(env -i PATH="$bin:$(dirname -- "$pi"):/usr/bin:/bin" SHELL=/bin/sh HOME="$home" TMUX_TMPDIR="$root"
+clean=(env -i PATH="$bin:$(dirname -- "$pi"):/usr/bin:/bin" SHELL=/bin/sh HOME="$home" LANG=C.UTF-8
   PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0)
 client() { "${clean[@]}" tmux -N -S "$1" "${@:2}"; }
 work() { client "$configured" "$@"; }
@@ -45,7 +45,7 @@ mark_wait() { wait_for marked "$1" "$2" || fail "$1 never reported '$2'."; }
 
 # Set up a private receiver and fixture, capturing receiver stderr for the collision check.
 cargo build --quiet --locked --release --manifest-path "$product/Cargo.toml" --target-dir "$root/target"
-install -d "$bin" "$share" "$home/.pi/agent/extensions"
+install -d "$bin" "$share" "$home/.pi/agent/extensions" "${default%/*}"
 install -d -m 700 "${signal%/*}"
 install -m 755 "$root/target/release/pi-tmux-signals" "$bin/"
 install -m 644 "$product/chooser.tmux" "$share/"
@@ -59,9 +59,7 @@ printf '%s\n' \
 mkdir "$root"/{default-first,default-second,first,second,nested,blocked}
 
 start() {
-  local -a flags=()
-  if [[ $configured == "$named" ]]; then flags=(-S "$configured" -f "$config"); fi
-  "${clean[@]}" tmux "${flags[@]}" new-session -d -s startup -n observed -x 120 -y 40 -c "$root/$1" pi \
+  "${clean[@]}" tmux -S "$configured" -f "$config" new-session -d -s startup -n observed -x 120 -y 40 -c "$root/$1" pi \
     \; set-option -w remain-on-exit on \; new-window -n plain sleep 300
 }
 registered() {
@@ -84,10 +82,14 @@ open_chooser() {
 chooser_is() {
   local row
   row=$(view capture-pane -p | grep -m1 -E ': observed([* -]|$)') || return 1
-  if [[ -n $1 ]]; then [[ $row == *" [$1]" ]]; else [[ $row != *' ['* ]]; fi
+  if [[ -n $1 ]]; then [[ $row == *" [$1]" ]]; else [[ $row != *' ['* ]]; fi || return 1
+  case ${2:-} in
+    unread) [[ $row == *" ● [$1]" ]] ;;
+    seen) [[ $row != *' ● '* ]] ;;
+  esac
 }
 expect_chooser() {
-  if ! wait_for chooser_is "$1"; then view capture-pane -p >&2; fail "Expected chooser label '${1:-none}'."; fi
+  if ! wait_for chooser_is "$@"; then view capture-pane -p >&2; fail "Expected chooser label '${1:-none}' ${2:-}."; fi
 }
 close_chooser() {
   local target
@@ -117,7 +119,7 @@ status_cycle() {
   expect_chooser busy
   touch "$root/$1/release"
   mark_wait "$1" settled
-  expect_chooser done
+  expect_chooser done unread
   close_chooser
 }
 
@@ -165,9 +167,33 @@ expect_chooser busy
 no_opt_in
 touch "$root/first/release"
 mark_wait first settled
-expect_chooser done
+expect_chooser done unread
+work select-pane -t startup:observed -T 'unread-preview-canary'
+view send-keys Up
+previewed_observed() { view capture-pane -p | grep -qF '0:unread-preview-canary'; }
+wait_for previewed_observed || fail 'Chooser did not preview the observed window.'
+[[ $(work list-clients -F '#{window_name}') == plain ]] || fail 'Preview changed the current window.'
+expect_chooser done unread
+view send-keys Enter
+selected_observed() { [[ $(work list-clients -F '#{window_name}') == observed ]]; }
+wait_for selected_observed || fail 'Chooser did not select the observed window.'
+view send-keys C-b w
+expect_chooser done seen
+view send-keys q
+chooser_closed() { [[ $(work display-message -p -t startup:observed '#{pane_in_mode}') == 0 ]]; }
+wait_for chooser_closed || fail 'Chooser did not close before running Pi in the current window.'
+: > "$root/first/trace"
+rm -- "$root/first/release"
+submit "$configured"
+mark_wait first running
+active_busy() { [[ $(work display-message -p -t startup:observed '#{E:@glowkin-pi-chooser-suffix}') == '#[default] [busy]' ]]; }
+wait_for active_busy || fail 'Current window did not show busy without a dot.'
+touch "$root/first/release"
+mark_wait first settled
+view send-keys C-b w
+expect_chooser done seen
 close_chooser
-printf 'Fresh non-default server: [idle] → [busy] → [done]; nested unconfigured server with the same pane ID stayed independent.\n'
+printf 'Fresh non-default server: chooser preview preserved unread completion; selection kept [done] but cleared the dot. An active Pi run finished without a dot. The nested unconfigured server stayed independent.\n'
 
 # Restart at once: no socket cleanup, rebuild, setup, or config changes in between.
 stop
