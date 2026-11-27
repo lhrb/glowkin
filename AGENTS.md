@@ -1,6 +1,7 @@
 # Project instructions
 
 - Read [architecture.md](architecture.md) before designing or changing code.
+- Read [android/design.md](android/design.md) before designing or changing Android UI.
 - Make the smallest working change. Preserve guarantees; avoid scaffolding and unrelated changes.
 - Choose routine design and UX defaults. Escalate consequential product, security, privacy, data-lifecycle, or compatibility decisions.
 - Verify relevant behavior, report gaps, and stop at scope.

@@ -21,10 +21,10 @@ class ConnectionScreenTest {
 
     @Test fun savedEndpointReconnectsToAnOverviewForAnOlderBridge() = withApp { server, scenario ->
         connect(server)
-        awaitText("Session overview")
+        awaitText("Workspace")
         awaitText("This bridge does not report tmux windows. Update the bridge to use workspace controls.")
-        compose.onNodeWithText("Connected").assertIsDisplayed()
-        compose.onNodeWithText("Window count unavailable").assertIsDisplayed()
+        compose.onNodeWithText("1 window").assertDoesNotExist()
+        compose.onNodeWithText("Refresh").assertDoesNotExist()
         compose.onNodeWithText("0 windows").assertDoesNotExist()
         compose.onNodeWithText("Bridge revision: first").assertDoesNotExist()
         compose.onNodeWithText("Open shell").assertDoesNotExist()
@@ -32,7 +32,7 @@ class ConnectionScreenTest {
 
         server.revision.set("after-recreation")
         scenario.recreate()
-        awaitText("Session overview")
+        awaitText("Workspace")
         click("Connection")
         awaitText("Connected")
         awaitText("Bridge revision: after-recreation")
@@ -40,12 +40,12 @@ class ConnectionScreenTest {
         compose.onNode(hasSetTextAction() and hasText("Hostname or IP address")).assertTextContains("127.0.0.1")
         compose.onNode(hasSetTextAction() and hasText("Port")).assertTextContains(server.port.toString())
 
-        click("Overview")
-        awaitText("Session overview")
+        compose.onNodeWithContentDescription("Back to workspace").performClick()
+        awaitText("Workspace")
         click("Connection")
         click("Disconnect")
         awaitText("Disconnected")
-        compose.onNodeWithText("Overview").assertIsNotEnabled()
+        compose.onNodeWithContentDescription("Back to workspace").assertDoesNotExist()
         awaitText("Stale snapshot — not current PC state")
         compose.onNodeWithText("Bridge revision: after-recreation").assertExists()
     }
@@ -55,21 +55,22 @@ class ConnectionScreenTest {
         connect(server)
         awaitFailure()
         server.failing = false
-        awaitText("Session overview")
+        awaitText("Workspace")
         click("Connection")
+        awaitText("PC bridge")
         awaitText("Connected")
 
         server.failing = true
         awaitFailure()
         server.failing = false
         awaitText("Connected")
-        compose.onNodeWithText("Session overview").assertDoesNotExist()
+        compose.onNodeWithText("Workspace").assertDoesNotExist()
         scenario.recreate()
         awaitText("Connected")
-        compose.onNodeWithText("Session overview").assertDoesNotExist()
+        compose.onNodeWithText("Workspace").assertDoesNotExist()
 
         click("Retry")
-        awaitText("Session overview")
+        awaitText("Workspace")
     }
 
     private fun awaitFailure() = awaitText("This endpoint is not a compatible v1 bridge. Check the port and update or restart the PC bridge; then retry.")

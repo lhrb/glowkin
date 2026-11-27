@@ -36,9 +36,9 @@ class PanePreviewTest {
     @Test fun reselectionDiscardsDelayedResponseEvenForTheSamePane() = withApp { server, _ ->
         click("Pane A")
         val old = server.nextRead("%1")
-        click("Overview")
+        backToWorkspace()
         click("Pane B")
-        click("Overview")
+        backToWorkspace()
         click("Pane A")
         old.reply("obsolete A")
 
@@ -47,7 +47,7 @@ class PanePreviewTest {
         fresh.reply("fresh A\n    indented\n")
         awaitText("fresh A\n    indented\n")
 
-        click("Overview")
+        backToWorkspace()
         click("Pane B")
         compose.onNodeWithText("fresh A", substring = true).assertDoesNotExist()
         server.nextRead("%2").reply("current B")
@@ -59,8 +59,8 @@ class PanePreviewTest {
         }
         awaitText("Pane is no longer available. Select a window again.")
         assertNull("ineligible selection must stop reading", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        backToWorkspace()
         compose.onNodeWithText("2 windows").assertIsDisplayed()
-        click("Overview")
         compose.onNodeWithText("Pane B").assertHasNoClickAction()
     }
 
@@ -93,16 +93,16 @@ class PanePreviewTest {
         compose.onNodeWithText("after Back").assertDoesNotExist()
     }
 
-    @Test fun bottomOverviewDiscardsAnInFlightRead() = withApp { server, _ ->
+    @Test fun headerBackDiscardsAnInFlightRead() = withApp { server, _ ->
         click("Pane A")
         server.nextRead("%1").reply("detail before overview")
         awaitText("detail before overview")
         val delayed = server.nextRead("%1")
-        click("Overview")
+        backToWorkspace()
         delayed.reply("late after overview")
         awaitText("Pane B")
         compose.onNodeWithText("detail before overview").assertDoesNotExist()
-        assertNull("bottom overview must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
+        assertNull("header Back must stop reads", server.reads.poll(2300, TimeUnit.MILLISECONDS))
         compose.onNodeWithText("late after overview").assertDoesNotExist()
     }
 
@@ -127,12 +127,12 @@ class PanePreviewTest {
         click("Pane A")
         server.nextRead("%1").reply("before loss")
         awaitText("before loss")
-        compose.onNodeWithText("2 windows").assertIsDisplayed()
         server.failSnapshots = true
         awaitText("Disconnected")
         compose.onNodeWithText("before loss").assertDoesNotExist()
         compose.onNodeWithText("2 windows").assertDoesNotExist()
-        compose.onNodeWithText("Window count unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Stale snapshot — not current PC state").assertExists()
+        compose.onNodeWithContentDescription("Back to workspace").assertDoesNotExist()
 
         server.failSnapshots = false
         awaitText("Pane B")
@@ -196,7 +196,7 @@ class PanePreviewTest {
             assertNull("a busy tap must not be queued", server.inputs.poll(2300, TimeUnit.MILLISECONDS))
             draftField().assertTextContains("Android unsent marker")
 
-            click("Overview")
+            backToWorkspace()
             click("Pane B")
             draftField().assert(!hasText("Android unsent marker", substring = true))
             draftField().performTextReplacement("background marker")
@@ -209,7 +209,7 @@ class PanePreviewTest {
             val oldEnter = compose.onNodeWithText("Enter").fetchSemanticsNode().config[SemanticsActions.OnClick].action!!
             server.revision = "new-bridge"
             awaitText("Pane is no longer available. Select a window again.")
-            click("Overview")
+            backToWorkspace()
             click("Pane B")
             draftField().assert(!hasText("obsolete bridge marker", substring = true))
             activity.onActivity { oldEnter() }
@@ -220,7 +220,7 @@ class PanePreviewTest {
             awaitText("Pane is no longer available. Select a window again.")
             draftField().assertDoesNotExist()
             compose.onNodeWithText("invalidated marker").assertDoesNotExist()
-            click("Overview")
+            backToWorkspace()
             click("Pane A")
             draftField().performTextReplacement("disconnect marker")
             server.failSnapshots = true
@@ -239,7 +239,7 @@ class PanePreviewTest {
             awaitText("current preview")
             click("Enter")
             val lost = server.nextInput("%1")
-            click("Overview")
+            backToWorkspace()
             val open = compose.onNodeWithText("Open shell")
             open.assertIsNotEnabled().performTouchInput { click() }
             click("Pane A")
@@ -252,7 +252,7 @@ class PanePreviewTest {
                 awaitText("Input may have been injected. Check the pane before trying again.")
                 compose.onNodeWithText("Input paused until a fresh snapshot arrives.").assertIsDisplayed()
                 compose.onNodeWithText("Input injected. Check the pane for its effect.").assertDoesNotExist()
-                click("Overview")
+                backToWorkspace()
                 open.assertIsNotEnabled().performTouchInput { click() }
                 assertEquals(0, server.openCount)
                 assertEquals(1, server.inputCount)
@@ -321,6 +321,8 @@ class PanePreviewTest {
     }
 
     private fun click(text: String) = compose.onNodeWithText(text).performClick()
+
+    private fun backToWorkspace() = compose.onNodeWithContentDescription("Back to workspace").performClick()
 
     private fun back(activity: ActivityScenario<MainActivity>) = activity.onActivity {
         it.onBackPressedDispatcher.onBackPressed()

@@ -14,9 +14,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
 import dev.lhrb.app.glowkin.features.connection.ConnectionModule
@@ -57,13 +58,12 @@ class MainActivity : ComponentActivity() {
                 BackHandler(enabled = selectedName != null || canCloseConnection, onBack = returnToOverview)
                 Scaffold(
                     modifier = Modifier.fillMaxSize().imePadding(),
-                    bottomBar = {
-                        WorkspaceBar(
-                            state,
-                            canShowOverview = !showConnection || canCloseConnection,
-                            onOverview = returnToOverview,
-                            onConnection = {
-                                if (!showConnection) {
+                    topBar = {
+                        WorkspaceHeader(
+                            title = if (showConnection) "PC bridge" else selectedName ?: "Workspace",
+                            onBack = returnToOverview.takeIf { selectedName != null || canCloseConnection },
+                            onConnection = if (showConnection) null else {
+                                {
                                     if (paneName != null) leaveDetail()
                                     connectionRequested = true
                                 }
@@ -94,7 +94,7 @@ class MainActivity : ComponentActivity() {
                             val shown = state
                             val pane = preview
                             PaneDetail(
-                                selectedName, shown, pane, paneDraft, mutating,
+                                shown, pane, paneDraft, mutating,
                                 onDraft = { draft ->
                                     if (pane.selection === preview.selection && preview.offersInput(state) && !mutating) {
                                         paneDraft = draft
@@ -170,47 +170,22 @@ class MainActivity : ComponentActivity() {
     override fun onStop() { connection.stop(); super.onStop() }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun WorkspaceBar(
-    state: ConnectionState,
-    canShowOverview: Boolean,
-    onOverview: () -> Unit,
-    onConnection: () -> Unit,
-) {
-    val windowCount = if (state.status == ConnectionStatus.CONNECTED && !state.stale) {
-        (state.snapshot?.workspace as? Workspace.Ready)?.windows?.size
-    } else null
-    val countLabel = when (windowCount) {
-        null -> "Window count unavailable"
-        1 -> "1 window"
-        else -> "$windowCount windows"
-    }
-    val connectionLabel = when (state.status) {
-        ConnectionStatus.CONNECTING -> "Connecting…"
-        ConnectionStatus.CONNECTED -> "Connected"
-        ConnectionStatus.DISCONNECTED -> "Disconnected"
-    }
-    Surface(tonalElevation = 3.dp) {
-        Row(
-            Modifier.fillMaxWidth().windowInsetsPadding(
-                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom),
-            ),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(onClick = onOverview, modifier = Modifier.weight(1f), enabled = canShowOverview) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Overview")
-                    Text(countLabel, style = MaterialTheme.typography.bodySmall)
+private fun WorkspaceHeader(title: String, onBack: (() -> Unit)?, onConnection: (() -> Unit)?) {
+    TopAppBar(
+        title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+        navigationIcon = {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(painterResource(R.drawable.ic_back), contentDescription = "Back to workspace")
                 }
             }
-            TextButton(onClick = onConnection, modifier = Modifier.weight(1f)) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("Connection")
-                    Text(connectionLabel, style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-    }
+        },
+        actions = {
+            if (onConnection != null) TextButton(onClick = onConnection) { Text("Connection") }
+        },
+    )
 }
 
 @Composable
@@ -230,7 +205,11 @@ private fun ConnectionScreen(
         state.endpoint?.let { host = it.host; port = it.port.toString() }
     }
     Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("PC bridge", style = MaterialTheme.typography.headlineMedium)
+        Text(when (state.status) {
+            ConnectionStatus.CONNECTING -> "Connecting…"
+            ConnectionStatus.CONNECTED -> "Connected"
+            ConnectionStatus.DISCONNECTED -> "Disconnected"
+        }, style = MaterialTheme.typography.titleMedium)
         state.endpoint?.let { Text("Saved endpoint: ${it.host} · port ${it.port}") }
         val error = inputError ?: storageError ?: when (state.error) {
             ConnectionError.UNREACHABLE -> "Cannot reach the bridge. Check its address and port, PC server, firewall, and WLAN or Tailscale connection; then retry."
@@ -247,7 +226,7 @@ private fun ConnectionScreen(
                 inputError = null
             } catch (failure: InvalidEndpoint) { inputError = failure.message }
         }) { Text(if (state.endpoint == null) "Save and connect" else "Replace and connect") }
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = onRetry, enabled = state.endpoint != null && !mutating) { Text("Retry") }
             OutlinedButton(onClick = onDisconnect, enabled = state.endpoint != null) { Text("Disconnect") }
         }

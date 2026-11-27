@@ -22,7 +22,6 @@ import dev.lhrb.app.glowkin.features.connection.domain.PaneInput.Key
 
 @Composable
 internal fun PaneDetail(
-    name: String,
     previewState: ConnectionState,
     preview: PanePreview,
     draft: String,
@@ -35,7 +34,7 @@ internal fun PaneDetail(
     BoxWithConstraints(modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         val controlsHeight = maxHeight * 0.68f
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(name, style = MaterialTheme.typography.headlineMedium)
+            Text("Terminal output", style = MaterialTheme.typography.titleMedium)
             Text(when {
                 previewState.needsReconciliation -> "Input paused until a fresh snapshot arrives."
                 offersInput -> "Pane input enabled"

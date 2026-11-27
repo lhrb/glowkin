@@ -62,6 +62,38 @@ class WorkspaceScreenTest {
         )
     }
 
+    @Test fun rejectedOpenIsNotUncertainAndDoesNotBlockAnotherExplicitAttempt() = withApp { server ->
+        server.rejectOpen = true
+        click("Open shell")
+        val rejected = "The bridge rejected Open shell. Check the bridge version and settings."
+        awaitWindow(rejected)
+        compose.onNodeWithText(rejected).assertIsDisplayed()
+        compose.onNodeWithText("Open shell may have succeeded.", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Shell window opened.").assertDoesNotExist()
+        compose.onNodeWithText("Open shell").assertIsEnabled().performClick()
+        compose.waitUntil(timeoutMillis = 10_000) { server.opens.size == 2 }
+        assertEquals(List(2) { Target("\$0", "first-generation") }, server.opens.toList())
+    }
+
+    @Test fun windowRowsKeepBridgeOrderAndDescribeWhatCanOpen() = withApp(longList = true) {
+        val list = compose.onNode(hasScrollToIndexAction())
+        val order = listOf("Window before 9", "Window before 10", "Window before 11")
+        list.performScrollToNode(hasText(order.last()))
+        val tops = order.map { name ->
+            compose.onNodeWithText(name).assertIsDisplayed().assertHasNoClickAction()
+                .getUnclippedBoundsInRoot().top
+        }
+        assertTrue(tops.zipWithNext().all { (before, after) -> before < after })
+        compose.onNodeWithText("Workspace").assertIsDisplayed()
+        compose.onNodeWithText("Connection").assertIsDisplayed().assertHasClickAction()
+
+        list.performScrollToNode(hasText("Readable work"))
+        val row = compose.onNode(hasText("Readable work") and hasText("Terminal output"))
+        row.assertIsDisplayed().assertHasClickAction().performClick()
+        awaitWindow("Current pane contents") // Fixture accepts only the exact session/window/pane.
+        compose.onNodeWithText("Terminal output").assertIsDisplayed()
+    }
+
     @Test fun windowCountTracksCurrentInventoryIncludingUnreadableWindows() = withApp { server ->
         awaitWindow("1 window")
         server.pcWindow = true
@@ -76,26 +108,42 @@ class WorkspaceScreenTest {
         compose.onNodeWithText("No windows reported for this session.").assertIsDisplayed()
     }
 
-    @Test fun bottomEntriesStayReachableWithoutCoveringTheLastRowOrPane() = withApp(longList = true) {
-        val overview = compose.onNodeWithText("Overview")
+    @Test fun nonReadyWorkspaceExplainsTheBlockerAndOnlyOffersRefresh() = withApp { server ->
+        for ((status, notice) in listOf(
+            "no_session" to "Start a tmux session on the PC to see its windows here.",
+            "multiple_sessions" to "Glowkin supports one tmux session at a time. Manage sessions on the PC.",
+            "unavailable" to "Cannot read tmux. Check that tmux and a session are running on the PC.",
+        )) {
+            server.workspaceStatus = status
+            click("Refresh")
+            awaitWindow(notice)
+            compose.onNodeWithText(notice).assertIsDisplayed()
+            compose.onNodeWithText("Open shell").assertDoesNotExist()
+            compose.onNodeWithText("0 windows").assertDoesNotExist()
+            compose.onNodeWithText("Preexisting editor").assertDoesNotExist()
+            compose.onNodeWithText("Refresh").assertIsEnabled()
+        }
+        assertTrue(server.opens.isEmpty())
+    }
+
+    @Test fun lastRowAndPaneStayBelowPersistentConnectionAction() = withApp(longList = true) {
         val connection = compose.onNodeWithText("Connection")
-        val barTop = connection.getUnclippedBoundsInRoot().top
         val list = compose.onNode(hasScrollToIndexAction())
-        val last = compose.onNodeWithText("Window after 24")
-        list.performScrollToIndex(49)
-        last.assertIsDisplayed()
-        assertTrue(last.getUnclippedBoundsInRoot().bottom < barTop)
-        connection.assertIsDisplayed()
-        overview.assertIsDisplayed()
-        assertEquals(barTop, connection.getUnclippedBoundsInRoot().top)
+        list.performScrollToNode(hasText("Window after 24"))
+        val last = compose.onNodeWithText("Window after 24").assertIsDisplayed()
+        val barBottom = connection.assertIsDisplayed().getUnclippedBoundsInRoot().bottom
+        val lastBounds = last.getUnclippedBoundsInRoot()
+        assertTrue(lastBounds.top >= barBottom)
+        assertTrue(lastBounds.bottom <= list.getUnclippedBoundsInRoot().bottom)
 
         val window = compose.onNodeWithText("Readable work")
         list.performScrollToNode(hasText("Readable work"))
         val top = window.getUnclippedBoundsInRoot().top
         window.performClick()
         awaitWindow("Current pane contents")
-        assertTrue(compose.onNodeWithText("Current pane contents").getUnclippedBoundsInRoot().bottom <= barTop)
-        overview.performClick()
+        val terminal = compose.onNodeWithText("Terminal output").assertIsDisplayed()
+        assertTrue(terminal.getUnclippedBoundsInRoot().top >= barBottom)
+        compose.onNodeWithContentDescription("Back to workspace").performClick()
         window.assertIsDisplayed()
         assertEquals(top, window.getUnclippedBoundsInRoot().top)
     }
@@ -110,10 +158,10 @@ class WorkspaceScreenTest {
         window.performClick()
         awaitWindow("Current pane contents")
         compose.onNodeWithText(windowName).assertIsDisplayed()
-        compose.onNodeWithText("Session overview").assertDoesNotExist()
+        compose.onNodeWithText("Workspace").assertDoesNotExist()
 
         pressBack()
-        compose.onNodeWithText("Session overview").assertIsDisplayed()
+        compose.onNodeWithText("Workspace").assertIsDisplayed()
         compose.onNodeWithText("Current pane contents").assertDoesNotExist()
         window.assertIsDisplayed()
         assertEquals(top, window.getUnclippedBoundsInRoot().top)
@@ -153,6 +201,8 @@ class WorkspaceScreenTest {
     private class WorkspaceServer(private val longList: Boolean) : AutoCloseable {
         @Volatile var pcWindow = false
         @Volatile var empty = false
+        @Volatile var rejectOpen = false
+        @Volatile var workspaceStatus = "ready"
         @Volatile var reachable = true
         val failedReads = AtomicInteger()
         val opens = CopyOnWriteArrayList<Target>()
@@ -186,12 +236,15 @@ class WorkspaceScreenTest {
                                 val target = Target(json.getString("sessionId"), json.getString("generation"))
                                 val firstOpen = opens.isEmpty()
                                 opens.add(target)
-                                if (firstOpen) {
-                                    reachable = false
-                                    // The bridge received the request, but the client sees no response.
-                                    return@use
+                                when {
+                                    rejectOpen -> "403 Forbidden" to ""
+                                    firstOpen -> {
+                                        reachable = false
+                                        // The bridge received the request, but the client sees no response.
+                                        return@use
+                                    }
+                                    else -> "204 No Content" to ""
                                 }
-                                "204 No Content" to ""
                             }
                             "POST /v1/workspace/read-pane HTTP/1.1" -> {
                                 val json = JSONObject(reader.readBody(headers))
@@ -217,7 +270,11 @@ class WorkspaceScreenTest {
         }
 
         private fun snapshot(): String {
-            val (id, generation, windows) = if (opens.isEmpty()) {
+            val status = workspaceStatus
+            if (status != "ready") {
+                return """{"protocolVersion":1,"revision":"bridge","workspace":{"status":"$status"}}"""
+            }
+            val (id, generation, windows) = if (opens.isEmpty() || rejectOpen) {
                 Triple("\$0", "first-generation", buildList {
                     if (!empty) add("Preexisting editor")
                     if (pcWindow) add("PC terminal")
