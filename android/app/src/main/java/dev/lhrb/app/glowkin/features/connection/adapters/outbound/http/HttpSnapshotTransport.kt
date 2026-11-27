@@ -93,6 +93,119 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
         }
     }
 
+    internal fun readPiChat(endpoint: Endpoint, target: PaneTarget, instanceId: String?): PiChatRead {
+        val body = paneBody(target).put("instanceId", instanceId).toString().toByteArray(Charsets.UTF_8)
+        val connection = connection(endpoint, "/v1/workspace/read-pi-chat")
+        try {
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("Cache-Control", "no-cache, no-store")
+            connection.postJson(body)
+            return when (connection.responseCode) {
+                200 -> {
+                    if (connection.contentType?.substringBefore(';')?.trim() != "application/json") return PiChatRead.Unavailable
+                    val bytes = connection.inputStream.use { it.readBytesBounded(256 * 1024) }
+                    PiChatRead.Available(parsePiChat(bytes.decodeToString(throwOnInvalidSequence = true)))
+                }
+                404 -> PiChatRead.Unsupported
+                409 -> PiChatRead.Conflict
+                410 -> PiChatRead.Exited
+                else -> PiChatRead.Unavailable
+            }
+        } catch (_: IOException) {
+            return PiChatRead.Unavailable
+        } catch (_: ConnectionFailure) {
+            return PiChatRead.Unavailable
+        } catch (_: IllegalStateException) {
+            return PiChatRead.Unavailable
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    internal fun editPiDraft(endpoint: Endpoint, target: PaneTarget, bridgeRevision: String, edit: PiDraftEdit): ChangeOutcome =
+        mutate(endpoint, "/v1/workspace/edit-pi-draft", paneBody(target)
+            .put("instanceId", edit.basis.instanceId).put("draftRevision", edit.basis.revision)
+            .put("text", edit.text).put("bridgeRevision", bridgeRevision))
+
+    private fun parsePiChat(body: String): PiChatSnapshot = JsonReader(StringReader(body)).use { reader ->
+        reader.isLenient = false
+        var instanceId: String? = null
+        var revision: String? = null
+        var draft: String? = null
+        var draftSeen = false
+        var messages: List<ChatMessage>? = null
+        var subagents: List<String>? = null
+        var subagentsSeen = false
+        var activity: PiActivity? = null
+        var queued: Boolean? = null
+        var inputEnabled: Boolean? = null
+        reader.readFields { field ->
+            when (field) {
+                "instanceId" -> instanceId = reader.readString()
+                "draftRevision" -> revision = reader.readString()
+                "draft" -> {
+                    draftSeen = true
+                    draft = reader.readNullable { readString() }
+                    if (draft?.let(::isValidPiDraft) == false) invalidProtocol()
+                }
+                "messages" -> messages = reader.readList { readChatMessage() }
+                "subagents" -> {
+                    subagentsSeen = true
+                    subagents = reader.readNullable { readList { readString() } }
+                }
+                "activity" -> activity = when (reader.readString()) {
+                    "idle" -> PiActivity.IDLE
+                    "working" -> PiActivity.WORKING
+                    "compacting" -> PiActivity.COMPACTING
+                    "respond_on_pc" -> PiActivity.RESPOND_ON_PC
+                    else -> invalidProtocol()
+                }
+                "queued" -> queued = reader.nextBoolean()
+                "inputEnabled" -> inputEnabled = reader.nextBoolean()
+                else -> reader.skipValue()
+            }
+        }
+        if (!draftSeen || !subagentsSeen || reader.peek() != JsonToken.END_DOCUMENT) invalidProtocol()
+        val conversation = messages ?: invalidProtocol()
+        if (conversation.distinctBy { it.id }.size != conversation.size) invalidProtocol()
+        PiChatSnapshot(requireId(instanceId), requireId(revision), draft, conversation, subagents,
+            activity ?: invalidProtocol(), queued ?: invalidProtocol(), inputEnabled ?: invalidProtocol())
+    }
+
+    private fun JsonReader.readChatMessage(): ChatMessage {
+        var id: String? = null
+        var role: ChatRole? = null
+        var text: String? = null
+        var tool: String? = null
+        readFields { field ->
+            when (field) {
+                "id" -> id = readString()
+                "role" -> role = when (readString()) {
+                    "user" -> ChatRole.USER
+                    "assistant" -> ChatRole.ASSISTANT
+                    "tool" -> ChatRole.TOOL
+                    else -> invalidProtocol()
+                }
+                "text" -> text = readString()
+                "tool" -> tool = readNullable { readString() }
+                else -> skipValue()
+            }
+        }
+        return ChatMessage(requireId(id), role ?: invalidProtocol(), requireString(text), tool)
+    }
+
+    private inline fun <T> JsonReader.readNullable(read: JsonReader.() -> T): T? =
+        if (peek() == JsonToken.NULL) { nextNull(); null } else read(this)
+
+    private inline fun <T> JsonReader.readList(read: JsonReader.() -> T): List<T> {
+        beginArray()
+        val items = buildList { while (hasNext()) add(read(this@readList)) }
+        endArray()
+        return items
+    }
+
+    private fun invalidProtocol(): Nothing = throw ConnectionFailure(ConnectionError.PROTOCOL)
+
     private fun HttpURLConnection.postJson(body: ByteArray) {
         requestMethod = "POST"
         doOutput = true
@@ -112,13 +225,13 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
         }
     }
 
-    private fun java.io.InputStream.readBytesBounded(): ByteArray {
+    private fun java.io.InputStream.readBytesBounded(limit: Int = 65536): ByteArray {
         val output = java.io.ByteArrayOutputStream()
         val buffer = ByteArray(4096)
         while (true) {
             val size = read(buffer)
             if (size < 0) return output.toByteArray()
-            if (output.size() + size > 65536) throw ConnectionFailure(ConnectionError.PROTOCOL)
+            if (output.size() + size > limit) throw ConnectionFailure(ConnectionError.PROTOCOL)
             output.write(buffer, 0, size)
         }
     }
@@ -217,15 +330,43 @@ class HttpSnapshotTransport(private val timeoutMillis: Int = 3000) : SnapshotTra
         var id: String? = null
         var name: String? = null
         var paneId: String? = null
+        var folder: WorkspaceFolder? = null
         readFields { field ->
             when (field) {
                 "id" -> id = readString()
                 "name" -> name = readString()
                 "paneId" -> paneId = requireId(readString())
+                "folder" -> folder = readFolder()
                 else -> skipValue()
             }
         }
-        return WorkspaceWindow(requireId(id), requireString(name), paneId)
+        return WorkspaceWindow(requireId(id), requireString(name), paneId, folder)
+    }
+
+    private fun JsonReader.readFolder(): WorkspaceFolder? {
+        // Invalid optional metadata should not hide the window or change pane eligibility.
+        if (peek() != JsonToken.BEGIN_OBJECT) {
+            skipValue()
+            return null
+        }
+        var key: String? = null
+        var name: String? = null
+        val seen = mutableSetOf<String>()
+        var valid = true
+        beginObject()
+        while (hasNext()) {
+            val field = nextName()
+            if (!seen.add(field)) valid = false
+            when {
+                field == "key" && peek() == JsonToken.STRING -> key = nextString()
+                field == "name" && peek() == JsonToken.STRING -> name = nextString()
+                else -> skipValue()
+            }
+        }
+        endObject()
+        if (!valid || key.isNullOrEmpty() || name.isNullOrBlank()) return null
+        if (name != "/" && '/' in name) return null
+        return WorkspaceFolder(key, name)
     }
 
     private inline fun JsonReader.readFields(read: (String) -> Unit) {

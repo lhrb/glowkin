@@ -12,6 +12,8 @@ use serde_json::Value;
 
 const BRIDGE: &str = env!("CARGO_BIN_EXE_glowkin-bridge");
 const SNAPSHOT: &str = "/v1/connection/snapshot";
+const READ_CHAT: &str = "/v1/workspace/read-pi-chat";
+const EDIT_DRAFT: &str = "/v1/workspace/edit-pi-draft";
 const TIMEOUT: Duration = Duration::from_secs(3);
 
 struct Process(Child);
@@ -24,11 +26,15 @@ impl Drop for Process {
 }
 
 fn start_bridge() -> (Process, SocketAddr) {
+    start_bridge_with(Command::new(BRIDGE).env("PATH", "/dev/null"))
+}
+
+fn start_bridge_with(command: &mut Command) -> (Process, SocketAddr) {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
     let mut bridge = Process(
-        Command::new(BRIDGE)
+        command
             .args(["--port", &address.port().to_string()])
             .stdout(Stdio::piped())
             .spawn()
@@ -48,13 +54,23 @@ fn start_bridge() -> (Process, SocketAddr) {
 }
 
 fn request(address: SocketAddr, method: &str, path: &str) -> String {
+    request_with_body(address, method, path, "", "")
+}
+
+fn request_with_body(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &str,
+) -> String {
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     stream.set_write_timeout(Some(TIMEOUT)).unwrap();
     // Deliberately no credentials.
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{headers}\r\n{body}"
     )
     .unwrap();
     let mut response = String::new();
@@ -152,6 +168,98 @@ fn client_disconnect_and_bridge_shutdown_leave_independent_process_running() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(sentinel.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn pi_chat_http_checks_without_tmux() {
+    // A valid request that reaches tmux must fail; no real tmux is in PATH.
+    let (_bridge, address) = start_bridge_with(
+        Command::new(BRIDGE)
+            .env("PATH", "/dev/null")
+            .arg("--enable-pane-input"),
+    );
+    let read = r#"{"sessionId":"$1","generation":"2-3","windowId":"@4","paneId":"%5"}"#;
+    let edit = serde_json::json!({
+        "sessionId": "$1", "generation": "2-3", "windowId": "@4", "paneId": "%5",
+        "instanceId": "0123456789abcdef0123456789abcdef", "draftRevision": "9", "text": "π\n\t", "bridgeRevision": "stale",
+    });
+    let response = request(address, "GET", READ_CHAT);
+    assert_chat_response(&response, 405);
+    assert!(
+        response
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("allow: POST"))
+    );
+    assert_chat_response(&request(address, "POST", EDIT_DRAFT), 415);
+    assert_chat_response(
+        &request_with_body(
+            address,
+            "POST",
+            READ_CHAT,
+            "Content-Type: application/json\r\n",
+            "",
+        ),
+        400,
+    );
+    assert_chat_response(
+        &post_chat(address, READ_CHAT, "Origin: http://local.test\r\n", read),
+        403,
+    );
+    assert_chat_response(&post_chat(address, READ_CHAT, "", read), 503);
+    assert_chat_response(
+        &post_chat(address, READ_CHAT, "", r#"["$1","2-3","@4","%5"]"#),
+        400,
+    );
+    assert_chat_response(
+        &post_chat(
+            address,
+            READ_CHAT,
+            "",
+            &format!(r#"{},"instanceId":null}}"#, read.trim_end_matches('}')),
+        ),
+        400,
+    );
+    assert_chat_response(&post_chat(address, EDIT_DRAFT, "", &edit.to_string()), 409);
+    let mut invalid = edit;
+    for bad_text in ["\r".to_owned(), "\u{2028}".to_owned(), "😀".repeat(4097)] {
+        invalid["text"] = bad_text.into();
+        assert_chat_response(
+            &post_chat(address, EDIT_DRAFT, "", &invalid.to_string()),
+            400,
+        );
+    }
+    invalid["text"] = "x".repeat(128 * 1024).into();
+    assert_chat_response(
+        &post_chat(address, EDIT_DRAFT, "", &invalid.to_string()),
+        413,
+    );
+
+    let (_bridge, address) = start_bridge_with(Command::new(BRIDGE).env("PATH", "/dev/null"));
+    assert_chat_response(&request(address, "POST", EDIT_DRAFT), 403);
+}
+
+fn post_chat(address: SocketAddr, path: &str, extra_headers: &str, body: &str) -> String {
+    request_with_body(
+        address,
+        "POST",
+        path,
+        &format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n{extra_headers}",
+            body.len()
+        ),
+        body,
+    )
+}
+
+fn assert_chat_response(response: &str, expected: u16) {
+    assert_eq!(status(response), expected);
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("cache-control: no-store"))
+    );
+    assert!(body.is_empty());
 }
 
 #[test]

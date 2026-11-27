@@ -1,10 +1,11 @@
 //! Exercise HTTP against disposable tmux, including windows not created by the bridge.
 use std::{
     collections::BTreeMap,
-    fs::{self, DirBuilder},
+    ffi::OsStr,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -13,7 +14,6 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 const SNAPSHOT: &str = "/v1/connection/snapshot";
 const OPEN_SHELL: &str = "/v1/workspace/open-shell";
@@ -81,6 +81,182 @@ fn inventory_includes_pc_windows_and_keeps_their_ids_on_refresh() {
             (new_id, "PC terminal".to_owned()),
         ]),
     );
+}
+
+#[test]
+fn snapshot_groups_exact_working_directories_without_changing_pane_targets() {
+    let tmux = Tmux::new();
+    let left = tmux.dir.join("private-left/project");
+    let right = tmux.dir.join("private-right/project");
+    let raw = tmux
+        .dir
+        .join(OsStr::from_bytes(b"parent\n@999\t\\\xff"))
+        .join("project");
+    let other_raw = tmux
+        .dir
+        .join(OsStr::from_bytes(b"parent\n@999\t\\\xfe"))
+        .join("project");
+    let unsafe_name = tmux.dir.join("bad\nname");
+    let blank = tmux.dir.join(" \t");
+    let invalid_name = tmux.dir.join(OsStr::from_bytes(b"bad\xffname"));
+    let deleted = tmux.dir.join("deleted");
+    let looks_deleted = tmux.dir.join("deleted (deleted)");
+    fs::create_dir_all(&left).unwrap();
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "-n",
+        "moving",
+        "-c",
+        left.to_str().unwrap(),
+        "/bin/sh",
+        "-i",
+    ]);
+    for (name, path) in [
+        ("left", &left),
+        ("right", &right),
+        ("raw", &raw),
+        ("same raw", &raw),
+        ("other raw", &other_raw),
+        ("unsafe name", &unsafe_name),
+        ("blank", &blank),
+        ("invalid name", &invalid_name),
+        ("deleted", &deleted),
+        ("looks deleted", &looks_deleted),
+        ("split", &left),
+    ] {
+        fs::create_dir_all(path).unwrap();
+        tmux.new_window_at(name, path);
+    }
+    fs::remove_dir(&deleted).unwrap();
+    tmux.run(&["split-window", "-d", "-t", "work:split", "/bin/sleep 300"]);
+    tmux.run(&[
+        "set-hook",
+        "-g",
+        "after-capture-pane",
+        "select-window -t work:left",
+    ]);
+
+    let bridge = Bridge::start(&tmux);
+    let first = bridge.workspace();
+    assert_eq!(ready_windows(&first), tmux.windows());
+    let folder = |name| window_named(&first, name)["folder"].clone();
+    for name in ["moving", "left", "right", "raw", "same raw", "other raw"] {
+        assert_eq!(folder(name)["name"], "project", "{name}");
+        assert!(!folder(name)["key"].as_str().unwrap().is_empty());
+    }
+    assert_eq!(folder("moving"), folder("left"));
+    assert_eq!(folder("raw"), folder("same raw"));
+    let keys: std::collections::HashSet<_> = ["left", "right", "raw", "other raw"]
+        .map(|name| folder(name)["key"].as_str().unwrap().to_owned())
+        .into_iter()
+        .collect();
+    assert_eq!(keys.len(), 4);
+    assert!(
+        window_named(&first, "left").get("paneId").is_none(),
+        "folder is independent of read eligibility"
+    );
+    for name in [
+        "split",
+        "unsafe name",
+        "blank",
+        "invalid name",
+        "deleted",
+        "looks deleted",
+    ] {
+        assert!(window_named(&first, name).get("folder").is_none(), "{name}");
+    }
+    let body = first.to_string();
+    for secret in [
+        "private-left",
+        "private-right",
+        "@999",
+        tmux.dir.to_str().unwrap(),
+    ] {
+        assert!(!body.contains(secret), "leaked {secret}");
+    }
+
+    tmux.run(&["set-hook", "-gu", "after-capture-pane"]);
+    let target = pane_target(&bridge.workspace(), "moving");
+    let pane = target["paneId"].as_str().unwrap();
+    tmux.run(&[
+        "send-keys",
+        "-l",
+        "-t",
+        pane,
+        &format!("cd '{}' && printf '%s%s\\n' moved- proof", right.display()),
+    ]);
+    tmux.run(&["send-keys", "-t", pane, "Enter"]);
+    tmux.wait_for_screen(pane, "moved-proof");
+    let next = bridge.workspace();
+    assert_eq!(
+        window_named(&next, "moving")["folder"],
+        window_named(&next, "right")["folder"]
+    );
+    assert_ne!(
+        window_named(&next, "moving")["folder"],
+        window_named(&next, "left")["folder"]
+    );
+    assert_eq!(pane_target(&next, "moving"), target);
+    let (status, screen) = bridge.read(&target, "");
+    assert_eq!(status, 200);
+    assert!(screen.contains("moved-proof"));
+    assert!(
+        !bridge
+            .read(&pane_target(&next, "right"), "")
+            .1
+            .contains("moved-proof")
+    );
+}
+
+#[test]
+fn over_limit_tmux_folder_output_keeps_pane_ids_and_input_capability() {
+    let tmux = Tmux::new();
+    let mut dir = tmux.dir.clone();
+    for _ in 0..14 {
+        dir.push("p".repeat(250));
+    }
+    dir.push("project");
+    fs::create_dir_all(&dir).unwrap();
+    tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "work",
+        "-n",
+        "focus",
+        "/bin/sleep 300",
+    ]);
+    tmux.new_window_at("project", &dir);
+    let bridge = Bridge::start_with_input(&tmux);
+    assert_eq!(
+        window_named(&bridge.workspace(), "project")["folder"]["name"],
+        "project"
+    );
+    for i in 0..20 {
+        tmux.new_window_at(&format!("project-{i}"), &dir);
+    }
+    assert!(
+        tmux.run(&["list-windows", "-a", "-F", "#{q:pane_current_path}"])
+            .len()
+            > 65536
+    );
+    let (status, body) = bridge.request("GET", SNAPSHOT, "", "");
+    assert_eq!(status, 200);
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["paneInputEnabled"], true);
+    let workspace = &snapshot["workspace"];
+    assert_eq!(ready_windows(workspace), tmux.windows());
+    for window in workspace["session"]["windows"].as_array().unwrap() {
+        assert!(window.get("folder").is_none());
+        let id = window["id"].as_str().unwrap();
+        assert_eq!(
+            window["paneId"],
+            tmux.run(&["display-message", "-p", "-t", id, "#{pane_id}"])
+        );
+    }
 }
 
 #[test]
@@ -568,7 +744,12 @@ fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
     const LEGACY: &str =
         "#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{session_name}\t#{window_name}";
     const WITH_PANES: &str = "#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{pane_id}\t#{session_name}\t#{window_name}";
-    for (json_limit, panes_fit) in [(false, false), (true, false), (true, true)] {
+    for (json_limit, panes_fit, capability_fits) in [
+        (false, false, true),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         let tmux = Tmux::new();
         let name = if json_limit {
             "\"".repeat(2500)
@@ -615,12 +796,17 @@ fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
         let (_, body) = bridge.request("GET", SNAPSHOT, "", "");
         let mut snapshot: Value = serde_json::from_str(&body).unwrap();
         snapshot.as_object_mut().unwrap().remove("paneInputEnabled");
-        if !panes_fit {
-            for window in snapshot["workspace"]["session"]["windows"]
-                .as_array_mut()
-                .unwrap()
-            {
-                assert!(window.as_object_mut().unwrap().remove("paneId").is_some());
+        for window in snapshot["workspace"]["session"]["windows"]
+            .as_array_mut()
+            .unwrap()
+        {
+            let window = window.as_object_mut().unwrap();
+            assert!(
+                window.remove("folder").is_some(),
+                "fixture needs folder metadata"
+            );
+            if !panes_fit {
+                assert!(window.remove("paneId").is_some());
             }
         }
         let bytes = |format| tmux.run(&["list-windows", "-a", "-F", format]).len() + 1;
@@ -629,11 +815,16 @@ fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
         } else {
             bytes(LEGACY)
         };
+        let headroom = if json_limit && capability_fits {
+            r#","paneInputEnabled":true"#.len()
+        } else {
+            8
+        };
         tmux.run(&[
             "rename-window",
             "-t",
             &last,
-            &"z".repeat(65536 - legacy_size - 8 + 1),
+            &"z".repeat(65536 - legacy_size - headroom + 1),
         ]);
         if json_limit {
             assert!(bytes(WITH_PANES) < 65536);
@@ -646,10 +837,12 @@ fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
         assert!(body.len() <= 65536);
         let snapshot: Value = serde_json::from_str(&body).unwrap();
         if json_limit {
-            assert_eq!(body.len(), 65536 - 8);
-            assert!(snapshot.get("paneInputEnabled").is_none());
-        } else {
+            assert_eq!(body.len(), if capability_fits { 65536 } else { 65536 - 8 });
+        }
+        if capability_fits {
             assert_eq!(snapshot["paneInputEnabled"], true);
+        } else {
+            assert!(snapshot.get("paneInputEnabled").is_none());
         }
         let workspace = &snapshot["workspace"];
         assert_eq!(ready_windows(workspace), tmux.windows());
@@ -658,7 +851,7 @@ fn optional_snapshot_fields_preserve_legacy_inventory_at_both_limits() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|w| w.get("paneId").is_some() == panes_fit)
+                .all(|w| w.get("paneId").is_some() == panes_fit && w.get("folder").is_none())
         );
         assert_eq!(bridge.open(&open_target(workspace), None), 204);
     }
@@ -684,7 +877,7 @@ case "$*" in
     *"capture-pane -p"*) if [ ! -e stalled ]; then : > stalled; exec /bin/sleep 15; fi ;;
 esac
 PATH=${PATH#*:}; export PATH
-exec tmux "$@"
+exec tmux -S "$GLOWKIN_TEST_SOCKET" "$@"
 "#,
     );
     let target = pane_target(&bridge.workspace(), "focus");
@@ -1033,6 +1226,11 @@ fn pane_input_rejects_input_disabled_modal_and_dead_panes() {
         thread::sleep(Duration::from_millis(10));
     }
     let before = tmux.panes();
+    assert!(
+        window_named(&bridge.workspace(), "target")
+            .get("folder")
+            .is_none()
+    );
     reject(json!({"text": "blocked"}), "dead pane");
     assert_eq!(tmux.panes(), before);
     tmux.assert_reader_received_only_probe(&pane_target(&workspace, "focus"), "focus-reader");
@@ -1171,14 +1369,14 @@ case "$*" in
     *"source-file -")
         if [ ! -e input-attempts ]; then
             echo first >> input-attempts
-            tmux "$@" >/dev/null || exit $?
+            tmux -S "$GLOWKIN_TEST_SOCKET" "$@" >/dev/null || exit $?
             : > delivered
             exec /bin/sleep 15
         fi
         echo next >> input-attempts
         ;;
 esac
-exec tmux "$@"
+exec tmux -S "$GLOWKIN_TEST_SOCKET" "$@"
 "#,
     );
     let target = pane_target(&bridge.workspace(), "target");
@@ -1275,30 +1473,25 @@ struct Tmux {
 
 impl Tmux {
     fn new() -> Self {
-        // /tmp keeps the Unix socket path short. Create private directories atomically.
-        let dir = PathBuf::from(format!("/tmp/glowkin-{}", Uuid::new_v4().simple()));
-        let uid = Command::new("id").arg("-u").output().unwrap();
-        assert!(uid.status.success());
-        let socket_dir = dir.join(format!(
-            "tmux-{}",
-            String::from_utf8(uid.stdout).unwrap().trim()
-        ));
-        let mut private_dir = DirBuilder::new();
-        private_dir.mode(0o700).create(&dir).unwrap();
-        let tmux = Self {
+        // /tmp keeps the Unix socket path short.
+        let output = Command::new("mktemp")
+            .arg("-d")
+            .env("TMPDIR", "/tmp")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let dir = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end());
+        fs::create_dir(dir.join("home")).unwrap();
+        Self {
+            socket: dir.join("socket"),
             dir,
-            socket: socket_dir.join("default"),
-        };
-        private_dir.create(&socket_dir).unwrap();
-        private_dir.create(tmux.dir.join("home")).unwrap();
-        tmux
+        }
     }
 
     fn command(&self, program: &str) -> Command {
         let mut command = Command::new(program);
         command
             .current_dir(&self.dir)
-            .env("TMUX_TMPDIR", &self.dir)
             .env("HOME", self.dir.join("home"))
             .env("XDG_CONFIG_HOME", self.dir.join("home"))
             .env("SHELL", "/bin/sh")
@@ -1311,7 +1504,7 @@ impl Tmux {
 
     fn tmux(&self) -> Command {
         let mut command = self.command("tmux");
-        // Explicit for setup/teardown; the bridge discovers this same private default socket.
+        // Setup, probes, and teardown always select this test's private socket.
         command
             .arg("-S")
             .arg(&self.socket)
@@ -1330,6 +1523,56 @@ impl Tmux {
             .unwrap()
             .trim_end_matches('\n')
             .to_owned()
+    }
+
+    fn new_window_at(&self, name: &str, path: &std::path::Path) {
+        // A literal argv path bypasses tmux's format expansion on -c.
+        let output = self
+            .tmux()
+            .args([
+                "new-window",
+                "-d",
+                "-t",
+                "work:",
+                "-n",
+                name,
+                "/bin/sh",
+                "-c",
+                "cd -- \"$1\" && exec /bin/sleep 300",
+                "glowkin-folder",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let output = self
+                .tmux()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("work:{name}"),
+                    "#{pane_current_path}",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            if output.stdout.strip_suffix(b"\n") == Some(path.as_os_str().as_bytes()) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unexpected cwd {:?}",
+                output.stdout
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn start_reader(&self, args: &[&str], output: &str) -> String {
@@ -1435,13 +1678,22 @@ struct Bridge {
 
 impl Bridge {
     fn start(tmux: &Tmux) -> Self {
-        Self::start_command(tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge")))
+        Self::start_with_input_args(tmux, &[])
     }
 
     fn start_with_input(tmux: &Tmux) -> Self {
-        let mut command = tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge"));
-        command.arg(ENABLE_PANE_INPUT);
-        Self::start_command(command)
+        Self::start_with_input_args(tmux, &[ENABLE_PANE_INPUT])
+    }
+
+    fn start_with_input_args(tmux: &Tmux, args: &[&str]) -> Self {
+        Self::start_with_tmux_wrapper(
+            tmux,
+            args,
+            r#"#!/bin/sh
+PATH=${PATH#*:}; export PATH
+exec tmux -S "$GLOWKIN_TEST_SOCKET" "$@"
+"#,
+        )
     }
 
     fn start_with_tmux_wrapper(tmux: &Tmux, args: &[&str], script: &str) -> Self {
@@ -1454,7 +1706,10 @@ impl Bridge {
         )
         .unwrap();
         let mut command = tmux.command(env!("CARGO_BIN_EXE_glowkin-bridge"));
-        command.args(args).env("PATH", path);
+        command
+            .args(args)
+            .env("PATH", path)
+            .env("GLOWKIN_TEST_SOCKET", &tmux.socket);
         Self::start_command(command)
     }
 

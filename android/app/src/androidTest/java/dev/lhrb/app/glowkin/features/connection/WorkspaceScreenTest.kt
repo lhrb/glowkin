@@ -17,6 +17,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.SocketException
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -99,6 +100,7 @@ class WorkspaceScreenTest {
         server.pcWindow = true
         click("Refresh")
         awaitWindow("2 windows")
+        compose.onNode(isHeading()).assertDoesNotExist()
         server.pcWindow = false
         click("Refresh")
         awaitWindow("1 window")
@@ -106,6 +108,50 @@ class WorkspaceScreenTest {
         click("Refresh")
         awaitWindow("0 windows")
         compose.onNodeWithText("No windows reported for this session.").assertIsDisplayed()
+    }
+
+    @Test fun groupsByExactFolderKeyAndMovesRowsWithoutChangingTheirTargets() = withApp(grouped = true) { server ->
+        assertRowsInOrder("work (1)", "Preexisting editor", "Moving tests", "work (2)", "Other editor", "Ungrouped", "Split panes")
+        compose.onNode(hasText("work (1)") and isHeading()).assertIsDisplayed()
+        compose.onNode(hasText("work (2)") and isHeading()).assertIsDisplayed()
+        compose.onNodeWithText("Split panes").assertHasNoClickAction()
+
+        click("Preexisting editor")
+        awaitWindow("Exact editor chat")
+        compose.onNodeWithContentDescription("Back to workspace").performClick()
+
+        server.moved = true
+        click("Refresh")
+        compose.waitUntil(timeoutMillis = 10_000) {
+            val heading = compose.onAllNodesWithText("work (2)").fetchSemanticsNodes().singleOrNull()
+            val moving = compose.onAllNodesWithText("Moving tests").fetchSemanticsNodes().singleOrNull()
+            heading != null && moving != null && heading.boundsInRoot.top < moving.boundsInRoot.top
+        }
+        assertRowsInOrder("work (1)", "Preexisting editor", "work (2)", "Other editor", "Moving tests", "Ungrouped", "Split panes")
+        click("Moving tests")
+        awaitWindow("Exact moving pane")
+        compose.onNodeWithText("Terminal output").assertIsDisplayed()
+    }
+
+    @Test fun retainsGroupedRowsWithoutClickActionsWhileWaitingForAFreshSnapshot() = withApp(grouped = true) { server ->
+        val pending = CountDownLatch(1)
+        server.snapshotGate = pending
+        try {
+            click("Refresh")
+            awaitWindow("Stale snapshot — not current PC state")
+            assertRowsInOrder("Stale snapshot — not current PC state", "work (1)", "Preexisting editor", "Moving tests",
+                "work (2)", "Other editor", "Ungrouped", "Split panes")
+            for (name in listOf("Preexisting editor", "Moving tests", "Other editor", "Split panes")) {
+                compose.onNodeWithText(name).assertHasNoClickAction()
+            }
+            compose.onNodeWithText("Open shell").assertIsNotEnabled()
+        } finally {
+            pending.countDown()
+        }
+        compose.waitUntil(timeoutMillis = 10_000) {
+            compose.onAllNodes(hasText("Moving tests") and hasClickAction()).fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Stale snapshot — not current PC state").assertDoesNotExist()
     }
 
     @Test fun nonReadyWorkspaceExplainsTheBlockerAndOnlyOffersRefresh() = withApp { server ->
@@ -167,12 +213,17 @@ class WorkspaceScreenTest {
         assertEquals(top, window.getUnclippedBoundsInRoot().top)
     }
 
-    private fun withApp(longList: Boolean = false, block: (WorkspaceServer) -> Unit) {
+    private fun assertRowsInOrder(vararg labels: String) {
+        val tops = labels.map { name -> compose.onNodeWithText(name).assertIsDisplayed().getUnclippedBoundsInRoot().top }
+        assertTrue(tops.zipWithNext().all { (before, after) -> before < after })
+    }
+
+    private fun withApp(longList: Boolean = false, grouped: Boolean = false, block: (WorkspaceServer) -> Unit) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val preferences = context.getSharedPreferences("connection", Context.MODE_PRIVATE)
         assertTrue(preferences.edit().clear().commit())
         try {
-            WorkspaceServer(longList).use { server ->
+            WorkspaceServer(longList, grouped).use { server ->
                 ActivityScenario.launch(MainActivity::class.java).use {
                     compose.onNode(hasSetTextAction() and hasText("Hostname or IP address"))
                         .performTextReplacement("127.0.0.1")
@@ -198,7 +249,9 @@ class WorkspaceScreenTest {
 
     private data class Target(val sessionId: String, val generation: String)
 
-    private class WorkspaceServer(private val longList: Boolean) : AutoCloseable {
+    private class WorkspaceServer(private val longList: Boolean, private val grouped: Boolean) : AutoCloseable {
+        @Volatile var moved = false
+        @Volatile var snapshotGate: CountDownLatch? = null
         @Volatile var pcWindow = false
         @Volatile var empty = false
         @Volatile var rejectOpen = false
@@ -225,6 +278,7 @@ class WorkspaceScreenTest {
                         val contentType = if (request == "POST /v1/workspace/read-pane HTTP/1.1") "text/plain" else "application/json"
                         val (status, body) = when (request) {
                             "GET /v1/connection/snapshot HTTP/1.1" -> if (reachable) {
+                                snapshotGate?.await(8, TimeUnit.SECONDS)
                                 "200 OK" to snapshot()
                             } else {
                                 failedReads.incrementAndGet()
@@ -246,12 +300,21 @@ class WorkspaceScreenTest {
                                     else -> "204 No Content" to ""
                                 }
                             }
+                            "POST /v1/workspace/read-pi-chat HTTP/1.1" -> {
+                                val json = JSONObject(reader.readBody(headers))
+                                if (grouped && json.targets(0)) {
+                                    "200 OK" to """{"instanceId":"pi","draftRevision":"d","draft":null,
+                                        "messages":[{"id":"m","role":"assistant","text":"Exact editor chat"}],
+                                        "subagents":null,"activity":"idle","queued":false,"inputEnabled":false}"""
+                                } else "404 Not Found" to ""
+                            }
                             "POST /v1/workspace/read-pane HTTP/1.1" -> {
                                 val json = JSONObject(reader.readBody(headers))
-                                check(longList && json.getString("sessionId") == "\$0" &&
-                                    json.getString("generation") == "first-generation" &&
-                                    json.getString("windowId") == "@25" && json.getString("paneId") == "%25")
-                                "200 OK" to "Current pane contents"
+                                when {
+                                    longList && json.targets(25) -> "200 OK" to "Current pane contents"
+                                    grouped && json.targets(2) -> "200 OK" to "Exact moving pane"
+                                    else -> error("Unexpected pane target: $json")
+                                }
                             }
                             else -> error("Unexpected request: $request")
                         }
@@ -269,7 +332,21 @@ class WorkspaceScreenTest {
             }
         }
 
+        private fun JSONObject.targets(index: Int): Boolean =
+            getString("sessionId") == "\$0" && getString("generation") == "first-generation" &&
+                getString("windowId") == "@$index" && getString("paneId") == "%$index"
+
         private fun snapshot(): String {
+            if (grouped) {
+                val secondKey = "opaque " // Distinct from "opaque", despite the same display name.
+                val movingKey = if (moved) secondKey else "opaque"
+                return """{"protocolVersion":1,"revision":"bridge","workspace":{"status":"ready",
+                    "session":{"id":"${'$'}0","name":"work","generation":"first-generation","windows":[
+                    {"id":"@0","name":"Preexisting editor","paneId":"%0","folder":{"key":"opaque","name":"work"}},
+                    {"id":"@1","name":"Other editor","paneId":"%1","folder":{"key":"$secondKey","name":"work"}},
+                    {"id":"@2","name":"Moving tests","paneId":"%2","folder":{"key":"$movingKey","name":"work"}},
+                    {"id":"@3","name":"Split panes"}]}}}"""
+            }
             val status = workspaceStatus
             if (status != "ready") {
                 return """{"protocolVersion":1,"revision":"bridge","workspace":{"status":"$status"}}"""

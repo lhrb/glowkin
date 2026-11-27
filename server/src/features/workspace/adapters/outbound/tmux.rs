@@ -1,4 +1,7 @@
-use std::{ffi::OsStr, fmt::Write, io, os::unix::ffi::OsStrExt, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap, ffi::OsStr, fmt::Write, io, os::unix::ffi::OsStrExt, process::Stdio,
+    time::Duration,
+};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -8,8 +11,8 @@ use tokio::{
 };
 
 use super::{
-    InputError, OpenError, PaneInput, PaneInputCommand, PaneKey, PaneTarget, ReadError, Session,
-    Target, Window, Workspace,
+    Folder, InputError, OpenError, PaneInput, PaneInputCommand, PaneKey, PaneTarget, PiChatError,
+    ReadError, Session, Target, Window, Workspace,
 };
 
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -17,6 +20,8 @@ const OUTPUT_LIMIT: usize = 64 * 1024;
 // tmux executes after-capture-pane even with -p. Refuse hooks rather than
 // running arbitrary PC actions or temporarily changing tmux configuration.
 const PANE_READ_ELIGIBLE: &str = "#{&&:#{==:#{window_panes},1},#{==:#{after-capture-pane},}}";
+const FOLDER_FIELD: &str =
+    "#{?#{&&:#{==:#{window_panes},1},#{==:#{pane_dead},0}},#{q:pane_current_path},}\t";
 
 pub(crate) struct Tmux {
     slots: Semaphore,
@@ -30,10 +35,17 @@ impl Tmux {
     }
 
     pub(crate) async fn inventory(&self) -> Workspace {
-        let (out, has_panes) = match self.list_windows(true).await {
+        if let Ok(out) = self.list_windows(true, true).await
+            && out.status.success()
+            && let Some(workspace) = parse_inventory_with_folders(&out.stdout)
+        {
+            return workspace;
+        }
+        // Folder failures (including output overflow) must not cost pane IDs.
+        let (out, has_panes) = match self.list_windows(true, false).await {
             Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
                 // Optional pane IDs must not displace a previously listable inventory.
-                (self.list_windows(false).await, false)
+                (self.list_windows(false, false).await, false)
             }
             out => (out, true),
         };
@@ -45,14 +57,19 @@ impl Tmux {
         }
     }
 
-    async fn list_windows(&self, has_panes: bool) -> io::Result<std::process::Output> {
+    async fn list_windows(
+        &self,
+        has_panes: bool,
+        with_folders: bool,
+    ) -> io::Result<std::process::Output> {
+        let folder_field = if with_folders { FOLDER_FIELD } else { "" };
         let pane_field = if has_panes {
             format!("#{{?{PANE_READ_ELIGIBLE},#{{pane_id}},}}\t")
         } else {
             String::new()
         };
         let command = format!(
-            "list-windows -a -F '#{{pid}}\t#{{start_time}}\t#{{session_id}}\t#{{window_id}}\t{pane_field}#{{session_name}}\t#{{window_name}}'"
+            "list-windows -a -F '{folder_field}#{{pid}}\t#{{start_time}}\t#{{session_id}}\t#{{window_id}}\t{pane_field}#{{session_name}}\t#{{window_name}}'"
         );
         self.run(&[
             "if-shell",
@@ -112,28 +129,7 @@ impl Tmux {
     }
 
     pub(crate) async fn read_pane(&self, target: PaneTarget) -> Result<String, ReadError> {
-        let session = target.session;
-        let sid = format!("${}", session.session_id);
-        let wid = format!("@{}", target.window_id);
-        let pane = format!("%{}", target.pane_id);
-        let window = format!("{sid}:{wid}");
-        // Resolve the window in its session, not by a global %pane lookup. In a
-        // single-pane window the format's pane is the only possible exact match.
-        let checks = [
-            "#{==:#{server_sessions},1}".to_owned(),
-            format!(
-                "#{{==:#{{pid}}-#{{start_time}},{}-{}}}",
-                session.server_pid, session.server_start
-            ),
-            format!("#{{==:#{{session_id}},{sid}}}"),
-            format!("#{{==:#{{window_id}},{wid}}}"),
-            PANE_READ_ELIGIBLE.to_owned(),
-            format!("#{{==:#{{pane_id}},{pane}}}"),
-        ];
-        let guard = checks
-            .into_iter()
-            .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
-            .unwrap();
+        let (window, pane, guard) = pane_read_selection(&target);
         // The branch runs in the same queue without yielding. -p prints the
         // visible screen only (no history, attributes, or tmux paste buffer).
         let capture = format!("capture-pane -p -t '{pane}'");
@@ -147,6 +143,29 @@ impl Tmux {
             return Err(ReadError::TargetUnavailable);
         }
         String::from_utf8(out.stdout).map_err(|_| ReadError::CaptureFailed)
+    }
+
+    pub(super) async fn pi_chat_marker(
+        &self,
+        target: &PaneTarget,
+    ) -> Result<Option<String>, PiChatError> {
+        let (window, pane, guard) = pane_read_selection(target);
+        // Run the guard and the pane-local option read synchronously in one queue.
+        // Without -A, show-options -p cannot return an inherited window option.
+        // Do not fire after-show-options hooks. list-commands has no such hook.
+        let script = format!(
+            "if-shell -F -t '{window}' '{guard}' {{\n\
+                if-shell -F -t '{window}' '#{{==:#{{after-show-options}},}}' {{\n\
+                    list-commands -F eligible show-options\n\
+                    show-options -pqv -t '{pane}' @glowkin-chat\n\
+                }}\n\
+            }} {{ list-commands -F stale show-options }}\n"
+        );
+        let output = self
+            .run_tmux(&["source-file", "-"], Some(script.as_bytes()))
+            .await
+            .map_err(|_| PiChatError::Uncertain)?;
+        parse_pi_chat_marker(output)
     }
 
     pub(crate) async fn send_input(&self, command: PaneInputCommand) -> Result<(), InputError> {
@@ -263,6 +282,57 @@ impl Tmux {
     }
 }
 
+fn pane_read_selection(target: &PaneTarget) -> (String, String, String) {
+    let session = &target.session;
+    let sid = format!("${}", session.session_id);
+    let wid = format!("@{}", target.window_id);
+    let pane = format!("%{}", target.pane_id);
+    // Resolve the window in its session, not by a global %pane lookup. In a
+    // single-pane window the format's pane is the only possible exact match.
+    let checks = [
+        "#{==:#{server_sessions},1}".to_owned(),
+        format!(
+            "#{{==:#{{pid}}-#{{start_time}},{}-{}}}",
+            session.server_pid, session.server_start
+        ),
+        format!("#{{==:#{{session_id}},{sid}}}"),
+        format!("#{{==:#{{window_id}},{wid}}}"),
+        PANE_READ_ELIGIBLE.to_owned(),
+        format!("#{{==:#{{pane_id}},{pane}}}"),
+    ];
+    let guard = checks
+        .into_iter()
+        .reduce(|left, right| format!("#{{&&:{left},{right}}}"))
+        .unwrap();
+    (format!("{sid}:{wid}"), pane, guard)
+}
+
+fn parse_pi_chat_marker(output: std::process::Output) -> Result<Option<String>, PiChatError> {
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        if no_server(&error) && !error.trim_end().ends_with(" (Permission denied)") {
+            return Err(PiChatError::Conflict);
+        }
+        return Err(PiChatError::Uncertain);
+    }
+    if !output.stderr.is_empty() {
+        return Err(PiChatError::Uncertain);
+    }
+    match output.stdout.as_slice() {
+        b"stale\n" => Err(PiChatError::Conflict),
+        b"eligible\n" => Ok(None),
+        bytes => {
+            let marker = bytes
+                .strip_prefix(b"eligible\n")
+                .and_then(|value| value.strip_suffix(b"\n"))
+                .ok_or(PiChatError::Uncertain)?;
+            std::str::from_utf8(marker)
+                .map(|marker| Some(marker.to_owned()))
+                .map_err(|_| PiChatError::Uncertain)
+        }
+    }
+}
+
 fn no_server(error: &str) -> bool {
     error.starts_with("no server running on ")
         || (error.starts_with("error connecting to ")
@@ -331,6 +401,7 @@ fn parse_inventory(bytes: &[u8], has_panes: bool) -> Option<Workspace> {
             id: id.to_owned(),
             name: row.next()?.to_owned(),
             pane_id,
+            folder: None,
         });
         Some(session_name.to_owned())
     };
@@ -355,6 +426,80 @@ fn parse_inventory(bytes: &[u8], has_panes: bool) -> Option<Workspace> {
     }))
 }
 
+fn parse_inventory_with_folders(mut bytes: &[u8]) -> Option<Workspace> {
+    if bytes.starts_with(b"count ") {
+        return parse_inventory(bytes, true);
+    }
+    let mut inventory = Vec::new();
+    let mut folders = Vec::new();
+    let mut keys = HashMap::new();
+    while !bytes.is_empty() {
+        let (path, row) = read_path_field(bytes)?;
+        let end = row.iter().position(|&byte| byte == b'\n')? + 1;
+        inventory.extend_from_slice(&row[..end]);
+        bytes = &row[end..];
+
+        folders.push(folder_name(&path).map(str::to_owned).map(|name| {
+            let next_key = keys.len();
+            let key = *keys.entry(path).or_insert(next_key);
+            Folder {
+                key: key.to_string(),
+                name,
+            }
+        }));
+    }
+    let Workspace::Ready(mut session) = parse_inventory(&inventory, true)? else {
+        return None;
+    };
+    for (window, folder) in session.windows.iter_mut().zip(folders) {
+        window.folder = folder;
+    }
+    Some(Workspace::Ready(session))
+}
+
+fn read_path_field(mut bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+    // tmux's q modifier prefixes shell specials (including backslash, LF and
+    // tab) with a backslash, leaving other bytes intact. Decode before UTF-8
+    // conversion and treat only unescaped tabs as delimiters.
+    let mut path = Vec::new();
+    while let Some((&byte, rest)) = bytes.split_first() {
+        bytes = rest;
+        match byte {
+            b'\t' => return Some((path, bytes)),
+            b'\n' => return None,
+            b'\\' => {
+                let (&escaped, rest) = bytes.split_first()?;
+                if !b"|&;<>(){}$`\\\"'*?[# =%\n\t".contains(&escaped) {
+                    return None;
+                }
+                path.push(escaped);
+                bytes = rest;
+            }
+            _ => path.push(byte),
+        }
+    }
+    None
+}
+
+fn folder_name(path: &[u8]) -> Option<&str> {
+    // Linux tmux reads at most PATH_MAX bytes from procfs. A path at that
+    // limit may be truncated. A deleted cwd has an ambiguous kernel suffix.
+    if !path.starts_with(b"/") || path.len() >= 4096 || path.ends_with(b" (deleted)") {
+        return None;
+    }
+    let basename = if path == b"/" {
+        path
+    } else {
+        path.rsplit(|&byte| byte == b'/').next()?
+    };
+    let name = std::str::from_utf8(basename).ok()?;
+    (!name.trim().is_empty()
+        && !name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}')))
+    .then_some(name)
+}
+
 fn quote_tmux_argument(arg: &OsStr) -> String {
     // Octal escapes in a tmux double-quoted token decode to literal bytes, not syntax.
     let mut quoted = String::from("\"");
@@ -363,4 +508,35 @@ fn quote_tmux_argument(arg: &OsStr) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::process::ExitStatusExt,
+        process::{ExitStatus, Output},
+    };
+
+    use super::*;
+
+    #[test]
+    fn requires_proof_of_exact_eligibility_before_reporting_marker_absence() {
+        let parse = |stdout: &[u8]| {
+            parse_pi_chat_marker(Output {
+                status: ExitStatus::from_raw(0),
+                stdout: stdout.to_vec(),
+                stderr: vec![],
+            })
+        };
+        assert_eq!(parse(b"eligible\n"), Ok(None));
+        assert_eq!(parse(b"eligible\n\n"), Ok(Some(String::new())));
+        assert_eq!(
+            parse(b"eligible\nactive:123\n"),
+            Ok(Some("active:123".into()))
+        );
+        assert_eq!(parse(b"stale\n"), Err(PiChatError::Conflict));
+        assert_eq!(parse(b""), Err(PiChatError::Uncertain));
+        assert_eq!(parse(b"eligible\nactive:123"), Err(PiChatError::Uncertain));
+        assert_eq!(parse(b"eligible\n\xff\n"), Err(PiChatError::Uncertain));
+    }
 }

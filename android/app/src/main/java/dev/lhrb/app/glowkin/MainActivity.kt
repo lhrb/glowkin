@@ -90,11 +90,43 @@ class MainActivity : ComponentActivity() {
                             },
                             modifier = modifier,
                         )
+                        selectedName != null && preview.showsChat -> {
+                            val pane = preview
+                            val chat = pane.chat!!
+                            val snapshot = chat.snapshot
+                            val permit = pane.editablePiDraft(state)
+                            val messages = remember(snapshot?.messages) {
+                                snapshot?.messages.orEmpty().map {
+                                    val role = when (it.role) {
+                                        ChatRole.USER -> PiChatRole.USER
+                                        ChatRole.ASSISTANT -> PiChatRole.ASSISTANT
+                                        ChatRole.TOOL -> PiChatRole.TOOL
+                                    }
+                                    PiChatMessage(it.id, role, it.text, it.tool)
+                                }
+                            }
+                            PiChatDetail(
+                                messages = messages,
+                                subagents = snapshot?.subagents,
+                                draft = pane.draftEdit?.text ?: snapshot?.draft,
+                                canEdit = permit != null && !mutating,
+                                notice = chat.notice ?: pane.inputFeedback,
+                                queued = snapshot?.queued == true,
+                                onDraftChange = { text ->
+                                    val chosen = pane.selection
+                                    if (chosen != null && permit != null) connection.editPiDraft(chosen, permit, text)
+                                },
+                                modifier = modifier,
+                            )
+                        }
                         selectedName != null -> {
                             val shown = state
                             val pane = preview
+                            // A known terminal can show paused controls while the new selection still probes Pi.
+                            val displayState = if (pane.terminalControlsPending) shown.copy(needsReconciliation = true) else shown
+                            val displayPane = if (pane.terminalControlsPending) pane.copy(chat = null) else pane
                             PaneDetail(
-                                shown, pane, paneDraft, mutating,
+                                displayState, displayPane, paneDraft, mutating,
                                 onDraft = { draft ->
                                     if (pane.selection === preview.selection && preview.offersInput(state) && !mutating) {
                                         paneDraft = draft
@@ -103,7 +135,8 @@ class MainActivity : ComponentActivity() {
                                 onInput = { input ->
                                     val chosen = pane.selection
                                     val currentDraft = input !is PaneInput.Text || input.value == paneDraft
-                                    val accepted = chosen != null && currentDraft && connection.sendInput(shown, chosen, input)
+                                    val accepted = !pane.terminalControlsPending && chosen != null && currentDraft &&
+                                        connection.sendInput(shown, chosen, input)
                                     if (accepted && input is PaneInput.Text) paneDraft = ""
                                     accepted
                                 },
@@ -127,7 +160,7 @@ class MainActivity : ComponentActivity() {
 
     private fun renderConnection(current: ConnectionState, error: String?, busy: Boolean, pane: PanePreview) {
         val offersInput = pane.offersInput(current)
-        if ((offersInput || pane.text?.isNotBlank() == true) && !previewProtected) {
+        if ((pane.chat != null || offersInput || pane.text?.isNotBlank() == true) && !previewProtected) {
             // Protect drafts and previews before composition, even before the first pane read.
             window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
             previewProtected = true
@@ -142,7 +175,7 @@ class MainActivity : ComponentActivity() {
                 recovering = false
                 if (reconnectRequested) closeConnectionPage()
             }
-            current.error != null -> {
+            current.error != null && !pane.showsChat -> {
                 recovering = true
                 if (paneName != null) leaveDetail()
             }
@@ -243,4 +276,21 @@ internal val ConnectionState.uncertainMessage: String?
     get() = if (changeOutcome != ChangeOutcome.UNCERTAIN) null else when (changeKind) {
         ChangeKind.OPEN_SHELL -> "Open shell may have succeeded. Check the PC windows before trying again."
         ChangeKind.PANE_INPUT -> "Input may have been injected. Check the pane before trying again."
+        ChangeKind.PI_DRAFT -> "The Pi draft may have changed. Check it on the PC."
+    }
+
+private val PiPaneRoute.Chat.notice: String?
+    get() = when (pause) {
+        PiChatPause.UNAVAILABLE -> "Pi conversation unavailable. Retrying while this pane is open."
+        PiChatPause.CONFLICT -> "Pi changed on the PC. Waiting for the current draft."
+        PiChatPause.SYNCING -> "Syncing draft…"
+        PiChatPause.UNCERTAIN -> "Draft update uncertain. Waiting for a fresh Pi read."
+        PiChatPause.INPUT_DISABLED -> "Draft editing was rejected. Checking the current draft."
+        null -> when {
+            snapshot == null -> "Checking for Pi…"
+            snapshot.activity == PiActivity.RESPOND_ON_PC -> "Respond on PC"
+            snapshot.activity == PiActivity.COMPACTING -> "Pi is compacting. Draft editing paused."
+            !snapshot.inputEnabled -> "Read-only bridge. Edit the draft on the PC."
+            else -> null
+        }
     }

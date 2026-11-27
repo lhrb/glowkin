@@ -395,6 +395,11 @@ class PanePreviewTest {
                                 status = "204 No Content"
                                 "application/json" to ""
                             }
+                            "POST /v1/workspace/read-pi-chat HTTP/1.1" -> {
+                                body()
+                                status = "404 Not Found"
+                                "application/json" to ""
+                            }
                             "POST /v1/workspace/read-pane HTTP/1.1" -> {
                                 val read = Read(body(), snapshotRequests)
                                 val text = automaticPaneText ?: run {

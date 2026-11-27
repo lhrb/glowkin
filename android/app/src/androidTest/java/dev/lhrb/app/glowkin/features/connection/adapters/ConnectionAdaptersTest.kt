@@ -4,6 +4,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.lhrb.app.glowkin.features.connection.adapters.outbound.endpoint.SharedPreferencesEndpointStore
 import dev.lhrb.app.glowkin.features.connection.adapters.outbound.http.HttpSnapshotTransport
 import dev.lhrb.app.glowkin.features.connection.domain.*
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.net.ServerSocket
@@ -55,6 +56,39 @@ class ConnectionAdaptersTest {
         }
     }
 
+    @Test fun optionalFolderMetadataPreservesExactValuesAndDoesNotInvalidateInventory() {
+        val valid = """{"key":"  opaque ","name":"shared π","future":{"value":1}}"""
+        val root = """{"key":"root","name":"/"}"""
+        val values = listOf(null, valid, root, "null", "[]", "123", "{}",
+            """{"key":"","name":"folder"}""",
+            """{"key":1,"name":"folder"}""",
+            """{"key":"id","name":"  "}""",
+            """{"key":"id","name":"parent/folder"}""",
+            """{"key":"id","name":false}""",
+            """{"key":"id","key":"other","name":"folder"}""",
+        )
+        val windows = values.mapIndexed { index, value ->
+            val folder = value?.let { ",\"folder\":$it" }.orEmpty()
+            """{"id":"@$index","name":"window $index","paneId":"%$index"$folder}"""
+        }
+        val body = """{"protocolVersion":1,"revision":"r","paneInputEnabled":true,"workspace":{
+            "status":"ready","session":{"id":"${'$'}0","generation":"g","name":"session",
+            "windows":[${windows.joinToString()}]}}}"""
+        serve(listOf(200 to body)) { endpoint ->
+            val snapshot = HttpSnapshotTransport(timeoutMillis = 1000).fetch(endpoint)
+            val workspace = snapshot.workspace as Workspace.Ready
+            assertEquals(values.mapIndexed { index, value ->
+                val folder = when (value) {
+                    valid -> WorkspaceFolder("  opaque ", "shared π")
+                    root -> WorkspaceFolder("root", "/")
+                    else -> null
+                }
+                WorkspaceWindow("@$index", "window $index", "%$index", folder)
+            }, workspace.windows)
+            assertTrue(snapshot.paneInputEnabled)
+        }
+    }
+
     @Test fun invalidOrIncompatibleSnapshotsNeverCountAsConnected() {
         for ((status, body) in listOf(
             200 to "not json",
@@ -100,6 +134,61 @@ class ConnectionAdaptersTest {
         }
     }
 
+    @Test fun chatAdapterPreservesExactTargetsAndDistinguishesReadAndEditOutcomes() {
+        val requests = mutableListOf<String>()
+        val target = PaneTarget(SessionTarget("\$0", "123-456"), "@1", "%2")
+        val snapshot = """{"instanceId":"pi","draftRevision":"r1","draft":"pc","messages":[{"id":"t1","role":"tool","text":"line","tool":"read"}],"subagents":null,"activity":"working","queued":true,"inputEnabled":true}"""
+        val responses = listOf(200 to snapshot) + listOf(404, 410, 409, 503, 204, 403, 409, 503).map { it to "" }
+        serve(responses, requests) { endpoint ->
+            val transport = HttpSnapshotTransport(timeoutMillis = 1500)
+            val available = transport.readPiChat(endpoint, target, null) as PiChatRead.Available
+            val chat = available.snapshot
+            assertEquals(listOf(ChatMessage("t1", ChatRole.TOOL, "line", "read")), chat.messages)
+            assertNull(chat.subagents)
+            assertTrue(chat.queued)
+            for (result in listOf(PiChatRead.Unsupported, PiChatRead.Exited, PiChatRead.Conflict, PiChatRead.Unavailable)) {
+                assertEquals(result, transport.readPiChat(endpoint, target, chat.instanceId))
+            }
+            val edit = PiDraftEdit(PiDraftPermit(chat.editableDraft!!), "phone\n\tdraft")
+            for (result in listOf(ChangeOutcome.APPLIED, ChangeOutcome.REJECTED, ChangeOutcome.TARGET_UNAVAILABLE,
+                ChangeOutcome.UNCERTAIN)) {
+                assertEquals(result, transport.editPiDraft(endpoint, target, "bridge-one", edit))
+            }
+        }
+        for ((index, request) in requests.withIndex()) {
+            val path = if (index < 5) "read-pi-chat" else "edit-pi-draft"
+            assertEquals("POST /v1/workspace/$path HTTP/1.1", request.lineSequence().first())
+            assertFalse(request.contains("Transfer-Encoding:", ignoreCase = true))
+            val body = JSONObject(request.substringAfter("\r\n\r\n"))
+            assertEquals("\$0", body.getString("sessionId"))
+            assertEquals("123-456", body.getString("generation"))
+            assertEquals("@1", body.getString("windowId"))
+            assertEquals("%2", body.getString("paneId"))
+            if (index == 0) assertFalse(body.has("instanceId")) else assertEquals("pi", body.getString("instanceId"))
+            if (index >= 5) {
+                assertEquals("r1", body.getString("draftRevision"))
+                assertEquals("bridge-one", body.getString("bridgeRevision"))
+                assertEquals("phone\n\tdraft", body.getString("text"))
+            }
+        }
+    }
+
+    @Test fun chatAdapterBoundsStreamedResponsesAndFailsClosedOnMalformedData() {
+        val base = """{"instanceId":"pi","draftRevision":"r1","draft":null,"messages":[],"subagents":[],"activity":"compacting","queued":false,"inputEnabled":true,"future":""}"""
+        val exactLimit = base.replace("\"future\":\"\"", "\"future\":\"${"x".repeat(256 * 1024 - base.length)}\"")
+        val duplicate = base.replace("\"queued\":false", "\"queued\":false,\"queued\":true")
+        val missingDraft = base.replace("\"draft\":null,", "")
+        val responses = listOf(exactLimit, "$exactLimit ", duplicate, missingDraft).map { 200 to it }
+        serve(responses, chunked = true) { endpoint ->
+            val transport = HttpSnapshotTransport(timeoutMillis = 1500)
+            val target = PaneTarget(SessionTarget("\$0", "123-456"), "@1", "%2")
+            val snapshot = (transport.readPiChat(endpoint, target, null) as PiChatRead.Available).snapshot
+            assertNull(snapshot.draft)
+            assertEquals(emptyList<String>(), snapshot.subagents)
+            repeat(3) { assertEquals(PiChatRead.Unavailable, transport.readPiChat(endpoint, target, null)) }
+        }
+    }
+
     @Test fun refusedConnectionMapsToActionableUnreachableError() {
         val port = ServerSocket(0).use { it.localPort }
         expectFailure(ConnectionError.UNREACHABLE) {
@@ -138,10 +227,10 @@ class ConnectionAdaptersTest {
                             if (line.isEmpty()) break
                             lines += line
                         }
-                        requests += lines.joinToString("\r\n")
                         val length = lines.firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
                             ?.substringAfter(':')?.trim()?.toInt() ?: 0
-                        repeat(length) { check(reader.read() >= 0) } // Fixture POST bodies are ASCII.
+                        val requestBody = CharArray(length) { reader.read().also { check(it >= 0) }.toChar() }
+                        requests += lines.joinToString("\r\n") + "\r\n\r\n" + requestBody.concatToString()
                         val bytes = body.toByteArray(Charsets.UTF_8)
                         val framing = if (chunked) "Transfer-Encoding: chunked" else "Content-Length: ${bytes.size}"
                         val header = "HTTP/1.1 $status Response\r\nContent-Type: $contentType\r\n$framing\r\nConnection: close\r\n\r\n"

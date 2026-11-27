@@ -1,6 +1,11 @@
+mod pi_chat;
+#[path = "adapters/outbound/pi_chat_socket.rs"]
+mod pi_chat_socket;
 #[path = "adapters/outbound/tmux.rs"]
 mod tmux;
 
+pub(crate) use pi_chat::{DraftText, PiChatError, PiInstanceId, edit_pi_draft, read_pi_chat};
+pub(crate) use pi_chat_socket::{ChatSnapshot, REQUEST_LIMIT as CHAT_REQUEST_LIMIT};
 pub(crate) use tmux::Tmux;
 
 pub(crate) enum Workspace {
@@ -20,6 +25,12 @@ pub(crate) struct Window {
     pub id: String,
     pub name: String,
     pub pane_id: Option<String>,
+    pub folder: Option<Folder>,
+}
+
+pub(crate) struct Folder {
+    pub key: String,
+    pub name: String,
 }
 
 pub(crate) struct Target {

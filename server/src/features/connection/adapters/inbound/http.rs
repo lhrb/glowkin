@@ -15,14 +15,17 @@ use tokio::{net::TcpListener, time::timeout};
 
 use super::domain::Snapshot;
 use crate::features::workspace::{
-    InputError, LiteralText, OpenError, PaneInput, PaneInputCommand, PaneKey, PaneTarget,
-    ReadError, Target, Tmux, Workspace,
+    CHAT_REQUEST_LIMIT, ChatSnapshot, DraftText, InputError, LiteralText, OpenError, PaneInput,
+    PaneInputCommand, PaneKey, PaneTarget, PiChatError, PiInstanceId, ReadError, Target, Tmux,
+    Workspace, edit_pi_draft, read_pi_chat,
 };
 
 const SNAPSHOT_PATH: &str = "/v1/connection/snapshot";
 const OPEN_PATH: &str = "/v1/workspace/open-shell";
 const READ_PATH: &str = "/v1/workspace/read-pane";
 const SEND_INPUT_PATH: &str = "/v1/workspace/send-input";
+const READ_PI_CHAT_PATH: &str = "/v1/workspace/read-pi-chat";
+const EDIT_PI_DRAFT_PATH: &str = "/v1/workspace/edit-pi-draft";
 const SNAPSHOT_BODY_LIMIT: usize = 65536;
 const TARGET_BODY_LIMIT: usize = 256;
 const INPUT_BODY_LIMIT: usize = 2048;
@@ -64,6 +67,23 @@ async fn respond(
     tmux: &Tmux,
     enable_pane_input: bool,
 ) -> Response<Full<Bytes>> {
+    let is_chat = matches!(request.uri().path(), READ_PI_CHAT_PATH | EDIT_PI_DRAFT_PATH);
+    let mut response = dispatch(request, snapshot, tmux, enable_pane_input).await;
+    if is_chat {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
+}
+
+async fn dispatch(
+    request: Request<Incoming>,
+    snapshot: &Snapshot,
+    tmux: &Tmux,
+    enable_pane_input: bool,
+) -> Response<Full<Bytes>> {
     let method = request.method();
     if !matches!(
         *method,
@@ -76,7 +96,9 @@ async fn respond(
     let path = request.uri().path_and_query().map(|target| target.as_str());
     let allowed = match path {
         Some(SNAPSHOT_PATH) => Method::GET,
-        Some(OPEN_PATH | READ_PATH | SEND_INPUT_PATH) => Method::POST,
+        Some(OPEN_PATH | READ_PATH | SEND_INPUT_PATH | READ_PI_CHAT_PATH | EDIT_PI_DRAFT_PATH) => {
+            Method::POST
+        }
         _ => return empty(StatusCode::NOT_FOUND),
     };
     if *method != allowed {
@@ -91,6 +113,18 @@ async fn respond(
     match path {
         Some(OPEN_PATH) => return empty(open_shell(request, tmux).await),
         Some(READ_PATH) => return pane_response(read_pane(request, tmux).await),
+        Some(READ_PI_CHAT_PATH) => {
+            return chat_response(read_chat(request, tmux).await, enable_pane_input);
+        }
+        Some(EDIT_PI_DRAFT_PATH) => {
+            if !enable_pane_input {
+                return empty(StatusCode::FORBIDDEN);
+            }
+            let status = edit_draft(request, tmux, &snapshot.revision)
+                .await
+                .map_or_else(|status| status, |()| StatusCode::NO_CONTENT);
+            return empty(status);
+        }
         Some(SEND_INPUT_PATH) => {
             if !enable_pane_input {
                 return empty(StatusCode::FORBIDDEN);
@@ -120,6 +154,25 @@ async fn respond(
     let advertised = body.to_string();
     if advertised.len() <= SNAPSHOT_BODY_LIMIT {
         encoded = advertised;
+    } else {
+        body.as_object_mut().unwrap().remove("paneInputEnabled");
+    }
+    // Folder data may use only the budget left after the baseline response.
+    if let Workspace::Ready(session) = &workspace
+        && session.windows.iter().any(|window| window.folder.is_some())
+        && let Some(entries) = body
+            .pointer_mut("/workspace/session/windows")
+            .and_then(Value::as_array_mut)
+    {
+        for (entry, window) in entries.iter_mut().zip(&session.windows) {
+            if let Some(folder) = &window.folder {
+                entry["folder"] = json!({"key": folder.key, "name": folder.name});
+            }
+        }
+        let with_folders = body.to_string();
+        if with_folders.len() <= SNAPSHOT_BODY_LIMIT {
+            encoded = with_folders;
+        }
     }
     let mut response = Response::new(Full::new(Bytes::from(encoded)));
     response.headers_mut().insert(
@@ -187,6 +240,36 @@ struct SendInputRequest {
     window_id: String,
     pane_id: String,
     input: InputRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReadChatRequest {
+    session_id: String,
+    generation: String,
+    window_id: String,
+    pane_id: String,
+    #[serde(default, deserialize_with = "present_string")]
+    instance_id: Option<String>,
+}
+
+fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EditDraftRequest {
+    session_id: String,
+    generation: String,
+    window_id: String,
+    pane_id: String,
+    instance_id: String,
+    draft_revision: String,
+    text: String,
+    bridge_revision: String,
 }
 
 #[derive(Deserialize)]
@@ -330,12 +413,99 @@ async fn send_input(request: Request<Incoming>, tmux: &Tmux) -> StatusCode {
     }
 }
 
-fn input_command(body: &[u8]) -> Option<PaneInputCommand> {
-    // Serde also accepts positional arrays for structs, but this endpoint requires an object.
+async fn read_chat(request: Request<Incoming>, tmux: &Tmux) -> Result<ChatSnapshot, StatusCode> {
+    let body = read_json_body(request, TARGET_BODY_LIMIT).await?;
+    let request: ReadChatRequest = parse_object(&body).ok_or(StatusCode::BAD_REQUEST)?;
+    let target = pane_target(
+        &request.session_id,
+        &request.generation,
+        &request.window_id,
+        &request.pane_id,
+    )
+    .ok_or(StatusCode::BAD_REQUEST)?;
+    let expected = match &request.instance_id {
+        Some(id) => Some(PiInstanceId::new(id).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    read_pi_chat(tmux, target, expected)
+        .await
+        .map_err(chat_error_status)
+}
+
+async fn edit_draft(
+    request: Request<Incoming>,
+    tmux: &Tmux,
+    bridge_revision: &str,
+) -> Result<(), StatusCode> {
+    let body = read_json_body(request, CHAT_REQUEST_LIMIT).await?;
+    let request: EditDraftRequest = parse_object(&body).ok_or(StatusCode::BAD_REQUEST)?;
+    let target = pane_target(
+        &request.session_id,
+        &request.generation,
+        &request.window_id,
+        &request.pane_id,
+    )
+    .ok_or(StatusCode::BAD_REQUEST)?;
+    let expected = PiInstanceId::new(&request.instance_id).ok_or(StatusCode::BAD_REQUEST)?;
+    let text = DraftText::new(&request.text).ok_or(StatusCode::BAD_REQUEST)?;
+    if request.bridge_revision != bridge_revision {
+        return Err(StatusCode::CONFLICT);
+    }
+    edit_pi_draft(tmux, target, expected, &request.draft_revision, text)
+        .await
+        .map_err(chat_error_status)
+}
+
+fn chat_error_status(error: PiChatError) -> StatusCode {
+    match error {
+        PiChatError::Unsupported => StatusCode::NOT_FOUND,
+        PiChatError::Exited => StatusCode::GONE,
+        PiChatError::Conflict => StatusCode::CONFLICT,
+        PiChatError::Uncertain => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+fn chat_response(
+    result: Result<ChatSnapshot, StatusCode>,
+    input_enabled: bool,
+) -> Response<Full<Bytes>> {
+    let snapshot = match result {
+        Ok(snapshot) => snapshot,
+        Err(status) => return empty(status),
+    };
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ChatResponse {
+        #[serde(flatten)]
+        snapshot: ChatSnapshot,
+        input_enabled: bool,
+    }
+    let body = serde_json::to_vec(&ChatResponse {
+        snapshot,
+        input_enabled,
+    })
+    .unwrap();
+    let mut response = Response::new(Full::new(Bytes::from(body)));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn parse_object<T: serde::de::DeserializeOwned>(body: &[u8]) -> Option<T> {
     if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return None;
     }
-    let request: SendInputRequest = serde_json::from_slice(body).ok()?;
+    serde_json::from_slice(body).ok()
+}
+
+fn input_command(body: &[u8]) -> Option<PaneInputCommand> {
+    let request: SendInputRequest = parse_object(body)?;
     let target = pane_target(
         &request.session_id,
         &request.generation,
@@ -396,6 +566,22 @@ mod tests {
 
     fn parse_input(input: &str) -> Option<PaneInputCommand> {
         input_command(format!(r#"{{{IDENTITY},"input":{input}}}"#).as_bytes())
+    }
+
+    #[tokio::test]
+    async fn chat_read_response_adds_input_flag_without_a_local_status() {
+        let body = json!({
+            "instanceId": "0123456789abcdef0123456789abcdef", "draftRevision": "1", "draft": "π",
+            "messages": [], "subagents": null, "activity": "idle", "queued": false,
+        });
+        let snapshot = serde_json::from_value(body.clone()).unwrap();
+        let response = chat_response(Ok(snapshot), false);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let actual: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut expected = body;
+        expected["inputEnabled"] = json!(false);
+        assert_eq!(actual, expected);
     }
 
     #[test]

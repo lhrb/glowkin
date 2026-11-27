@@ -13,7 +13,13 @@ sealed interface Workspace {
 }
 
 data class SessionTarget(val id: String, val generation: String)
-data class WorkspaceWindow(val id: String, val name: String, val paneId: String? = null)
+data class WorkspaceWindow(
+    val id: String,
+    val name: String,
+    val paneId: String? = null,
+    val folder: WorkspaceFolder? = null,
+)
+data class WorkspaceFolder(val key: String, val name: String)
 data class PaneTarget(val session: SessionTarget, val windowId: String, val paneId: String)
 
 sealed interface PaneRead {
@@ -42,7 +48,7 @@ enum class ConnectionStatus { DISCONNECTED, CONNECTING, CONNECTED }
 enum class ConnectionError { UNREACHABLE, PROTOCOL }
 class ConnectionFailure(val error: ConnectionError) : Exception(error.name)
 enum class ChangeOutcome { APPLIED, TARGET_UNAVAILABLE, REJECTED, UNCERTAIN, RECONCILIATION_REQUIRED, NOT_CONNECTED }
-enum class ChangeKind { OPEN_SHELL, PANE_INPUT }
+enum class ChangeKind { OPEN_SHELL, PANE_INPUT, PI_DRAFT }
 
 data class ConnectionState(
     val endpoint: Endpoint? = null,
@@ -154,7 +160,7 @@ class ConnectionUseCase(private val store: EndpointStorePort, private val transp
                     ChangeOutcome.APPLIED, ChangeOutcome.TARGET_UNAVAILABLE, ChangeOutcome.REJECTED -> {
                         if (kind == ChangeKind.OPEN_SHELL) {
                             state = state.copy(changeOutcome = outcome, changeKind = kind)
-                        } else if (state.changeKind == ChangeKind.PANE_INPUT) {
+                        } else if (state.changeKind == kind) {
                             state = state.copy(changeOutcome = null)
                         }
                     }
